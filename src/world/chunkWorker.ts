@@ -3,12 +3,21 @@ import {
   BLOCK,
   CHUNK,
   HALF,
+  NO_WATER,
   SEA_LEVEL,
   blockTypeFor,
-  heightAt,
+  columnAt,
   sideColor,
   topColor,
 } from "./worldgen";
+import {
+  TREE_NONE,
+  rockAt,
+  treeAt,
+  treeShape,
+  type RockShape,
+  type TreeShape,
+} from "./scenery";
 
 const MAXQ = CHUNK * CHUNK * 32;
 const positions = new Float32Array(MAXQ * 12);
@@ -16,13 +25,29 @@ const normals = new Float32Array(MAXQ * 12);
 const colors = new Float32Array(MAXQ * 12);
 const indices = new Uint32Array(MAXQ * 6);
 
+// inland water (rivers, glacial lakes) – separate transparent surface mesh
+const MAXW = CHUNK * CHUNK * 3;
+const wPos = new Float32Array(MAXW * 12);
+const wNrm = new Float32Array(MAXW * 12);
+const wDep = new Float32Array(MAXW * 4);
+const wIdx = new Uint32Array(MAXW * 6);
+
 const S = CHUNK + 2; // heights incl. 1 block border
 const hBuf = new Int16Array(S * S);
+const wBuf = new Int16Array(S * S);
 const tBuf = new Uint8Array(S * S);
 
-let q = 0; // quad counter
+let q = 0; // terrain quad counter
+let wq = 0; // water quad counter
 
 const rgb: [number, number, number] = [0, 0, 0];
+const col: { h: number; water: number } = { h: 0, water: NO_WATER };
+const treeShapeOut: TreeShape = { height: 0, trunkRadius: 0, canopy: 0, rot: 0 };
+const rockShapeOut: RockShape = { size: 0, rot: 0, sink: 0, squash: 0 };
+// per-tree: x, z, groundY, species, height, trunkRadius, canopy, rot
+export const TREE_STRIDE = 8;
+// per-boulder: x, z, groundY, size, rot, sink, squash
+export const ROCK_STRIDE = 7;
 
 function quad(
   ax: number, ay: number, az: number,
@@ -62,20 +87,53 @@ function quad(
   q++;
 }
 
+/** water surface quad: same winding rules, plus a baked water depth */
+function waterQuad(
+  ax: number, ay: number, az: number,
+  bx: number, by: number, bz: number,
+  cx: number, cy: number, cz: number,
+  dx: number, dy: number, dz: number,
+  nx: number, ny: number, nz: number,
+  depth: number,
+) {
+  if (wq >= MAXW) return;
+  const v = wq * 12;
+  wPos[v] = ax; wPos[v + 1] = ay; wPos[v + 2] = az;
+  wPos[v + 3] = bx; wPos[v + 4] = by; wPos[v + 5] = bz;
+  wPos[v + 6] = cx; wPos[v + 7] = cy; wPos[v + 8] = cz;
+  wPos[v + 9] = dx; wPos[v + 10] = dy; wPos[v + 11] = dz;
+  for (let i = 0; i < 4; i++) {
+    wNrm[v + i * 3] = nx;
+    wNrm[v + i * 3 + 1] = ny;
+    wNrm[v + i * 3 + 2] = nz;
+  }
+  wDep[wq * 4] = depth;
+  wDep[wq * 4 + 1] = depth;
+  wDep[wq * 4 + 2] = depth;
+  wDep[wq * 4 + 3] = depth;
+
+  const o = wq * 6;
+  const i0 = wq * 4;
+  wIdx[o] = i0; wIdx[o + 1] = i0 + 1; wIdx[o + 2] = i0 + 2;
+  wIdx[o + 3] = i0; wIdx[o + 4] = i0 + 2; wIdx[o + 5] = i0 + 3;
+  wq++;
+}
+
 function occ(d: number) {
   return d <= 0 ? 0 : d >= 2 ? 1 : d * 0.5;
 }
 
 function buildChunk(cx: number, cz: number) {
   q = 0;
+  wq = 0;
   const ox = cx * CHUNK;
   const oz = cz * CHUNK;
 
   for (let iz = 0; iz < S; iz++) {
     for (let ix = 0; ix < S; ix++) {
-      const wx = ox + ix - 1;
-      const wz = oz + iz - 1;
-      hBuf[iz * S + ix] = heightAt(wx, wz);
+      columnAt(ox + ix - 1, oz + iz - 1, col);
+      hBuf[iz * S + ix] = Math.floor(col.h);
+      wBuf[iz * S + ix] = col.water;
     }
   }
   for (let iz = 1; iz <= CHUNK; iz++) {
@@ -88,7 +146,7 @@ function buildChunk(cx: number, cz: number) {
         Math.abs(h - hBuf[i - S]),
         Math.abs(h - hBuf[i + S]),
       );
-      tBuf[i] = blockTypeFor(ox + ix - 1, oz + iz - 1, h, slope);
+      tBuf[i] = blockTypeFor(ox + ix - 1, oz + iz - 1, h, slope, wBuf[i]);
     }
   }
 
@@ -158,32 +216,122 @@ function buildChunk(cx: number, cz: number) {
           }
         }
       }
+
+      // ---- inland water surface (rivers / glacial lakes) ----
+      // the open ocean is drawn as one big plane, so only water clearly above
+      // sea level gets a per-chunk mesh
+      const wlev = wBuf[i];
+      if (wlev !== NO_WATER && wlev > SEA_LEVEL + 0.4 && wlev > h + 0.05) {
+        const depth = wlev - h;
+        waterQuad(
+          x0, wlev, z0, x0, wlev, z1, x1, wlev, z1, x1, wlev, z0,
+          0, 1, 0, depth,
+        );
+        // walls where the neighbouring column holds less (or no) water
+        const nbr: Array<[number, number, number, number]> = [
+          [i + 1, 1, 0, 0],
+          [i - 1, -1, 0, 0],
+          [i + S, 0, 0, 1],
+          [i - S, 0, 0, -1],
+        ];
+        for (let s = 0; s < 4; s++) {
+          const [ni, nx, , nz] = nbr[s];
+          const nw = wBuf[ni];
+          const nh = hBuf[ni];
+          const neighbourWater = nw !== NO_WATER && nw > SEA_LEVEL + 0.4 && nw > nh + 0.05 ? nw : NO_WATER;
+          if (neighbourWater !== NO_WATER && neighbourWater >= wlev - 0.04) continue;
+          let bottom = neighbourWater !== NO_WATER ? neighbourWater : nh;
+          if (bottom >= wlev - 0.02) continue;
+          if (bottom < wlev - 12) bottom = wlev - 12;
+          if (nx === 1) {
+            waterQuad(x1, wlev, z0, x1, wlev, z1, x1, bottom, z1, x1, bottom, z0, 1, 0, 0, 0.25);
+          } else if (nx === -1) {
+            waterQuad(x0, wlev, z1, x0, wlev, z0, x0, bottom, z0, x0, bottom, z1, -1, 0, 0, 0.25);
+          } else if (nz === 1) {
+            waterQuad(x1, wlev, z1, x0, wlev, z1, x0, bottom, z1, x1, bottom, z1, 0, 0, 1, 0.25);
+          } else {
+            waterQuad(x0, wlev, z0, x1, wlev, z0, x1, bottom, z0, x0, bottom, z0, 0, 0, -1, 0.25);
+          }
+        }
+      }
     }
   }
 
-  // compact column data for the main thread (collision, grass scattering)
+  // ---- scenery: resolved once here so the main thread never pays for it ----
+  const treeList: number[] = [];
+  const rockList: number[] = [];
+  for (let iz = 0; iz < CHUNK; iz++) {
+    for (let ix = 0; ix < CHUNK; ix++) {
+      const src = (iz + 1) * S + ix + 1;
+      const h = hBuf[src];
+      const w = wBuf[src];
+      const t = tBuf[src];
+      const wx = ox + ix;
+      const wz = oz + iz;
+      const slope = Math.max(
+        Math.abs(h - hBuf[src - 1]),
+        Math.abs(h - hBuf[src + 1]),
+        Math.abs(h - hBuf[src - S]),
+        Math.abs(h - hBuf[src + S]),
+      );
+      const species = treeAt(wx, wz, h, t, slope, w);
+      if (species !== TREE_NONE) {
+        treeShape(wx, wz, species, treeShapeOut);
+        treeList.push(
+          wx, wz, h, species,
+          treeShapeOut.height,
+          treeShapeOut.trunkRadius,
+          treeShapeOut.canopy,
+          treeShapeOut.rot,
+        );
+      }
+      if (rockAt(wx, wz, h, t, slope, w, rockShapeOut)) {
+        rockList.push(
+          wx, wz, h,
+          rockShapeOut.size,
+          rockShapeOut.rot,
+          rockShapeOut.sink,
+          rockShapeOut.squash,
+        );
+      }
+    }
+  }
+  const trees = new Float32Array(treeList);
+  const rocks = new Float32Array(rockList);
+
+  // compact column data for the main thread (collision, grass, swimming)
   const heights = new Int16Array(CHUNK * CHUNK);
+  const water = new Int16Array(CHUNK * CHUNK);
   const types = new Uint8Array(CHUNK * CHUNK);
   let hasWater = false;
   let grassCount = 0;
   for (let iz = 0; iz < CHUNK; iz++) {
     for (let ix = 0; ix < CHUNK; ix++) {
-      const h = hBuf[(iz + 1) * S + ix + 1];
-      const t = tBuf[(iz + 1) * S + ix + 1];
+      const src = (iz + 1) * S + ix + 1;
+      const h = hBuf[src];
+      const t = tBuf[src];
       heights[iz * CHUNK + ix] = h;
+      water[iz * CHUNK + ix] = wBuf[src];
       types[iz * CHUNK + ix] = t;
-      if (h < SEA_LEVEL) hasWater = true;
       if (t === BLOCK.GRASS) grassCount++;
     }
   }
+  hasWater = wq > 0;
 
   return {
     positions: positions.slice(0, q * 12),
     normals: normals.slice(0, q * 12),
     colors: colors.slice(0, q * 12),
     indices: indices.slice(0, q * 6),
+    wPositions: wPos.slice(0, wq * 12),
+    wNormals: wNrm.slice(0, wq * 12),
+    wDepths: wDep.slice(0, wq * 4),
+    wIndices: wIdx.slice(0, wq * 6),
     heights,
+    water,
     types,
+    trees,
+    rocks,
     hasWater,
     grassCount,
   };
@@ -200,14 +348,22 @@ self.onmessage = (ev: MessageEvent) => {
         r.normals.buffer,
         r.colors.buffer,
         r.indices.buffer,
+        r.wPositions.buffer,
+        r.wNormals.buffer,
+        r.wDepths.buffer,
+        r.wIndices.buffer,
         r.heights.buffer,
+        r.water.buffer,
         r.types.buffer,
+        r.trees.buffer,
+        r.rocks.buffer,
       ] as unknown as Transferable[],
     );
   } else if (msg.type === "heightmap") {
     const res: number = msg.res;
     const step = (HALF * 2) / res;
     const data = new Uint8Array(res * res);
+    const water = new Uint8Array(res * res);
     const batch = 64;
     for (let y0 = 0; y0 < res; y0 += batch) {
       const y1 = Math.min(res, y0 + batch);
@@ -215,14 +371,18 @@ self.onmessage = (ev: MessageEvent) => {
         const wz = -HALF + y * step;
         for (let x = 0; x < res; x++) {
           const wx = -HALF + x * step;
-          const h = heightAt(wx, wz);
-          data[y * res + x] = Math.max(0, Math.min(255, h));
+          columnAt(wx, wz, col);
+          const i = y * res + x;
+          data[i] = Math.max(0, Math.min(255, Math.floor(col.h)));
+          water[i] =
+            col.water === NO_WATER ? 0 : Math.max(1, Math.min(255, Math.floor(col.water)));
         }
       }
       (self as unknown as Worker).postMessage({ type: "progress", value: y1 / res });
     }
-    (self as unknown as Worker).postMessage({ type: "heightmap", res, data }, [
+    (self as unknown as Worker).postMessage({ type: "heightmap", res, data, water }, [
       data.buffer,
+      water.buffer,
     ] as unknown as Transferable[]);
   }
 };

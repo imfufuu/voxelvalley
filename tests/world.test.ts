@@ -21,7 +21,7 @@ let sum = 0;
 const N = 256;
 for (let z = 0; z < N; z++) {
   for (let x = 0; x < N; x++) {
-    const h = heightAt(x * 8 - 1024, z * 8 - 1024); // sample the whole 2048² map
+    const h = heightAt(x * 8 - 1024, z * 8 - 1024); // sample the whole world
     if (h < min) min = h;
     if (h > max) max = h;
     sum += h;
@@ -143,6 +143,52 @@ if (msg) {
   console.log(`grass: ${blades} blades, ${blooms} blooms (${(100 * rate).toFixed(2)}%), orange-red: ${orangeRed}`);
   check("no orange-red blades", orangeRed === 0, `${orangeRed} e.g. ${sample}`);
   check("blooms stay sparse", rate > 0.002 && rate < 0.04, `${(100 * rate).toFixed(2)}%`);
+}
+
+
+// ---- 6. inland water mesh (rivers / glacial lakes) ---------------------------
+{
+  // find a chunk that actually contains water
+  let found: any = null;
+  let at: [number, number] = [0, 0];
+  for (let cz = 0; cz < 40 && !found; cz++) {
+    for (let cx = 0; cx < 40 && !found; cx++) {
+      posted.length = 0;
+      handle({ data: { type: "chunk", key: `${cx},${cz}`, cx, cz } });
+      const m = posted.find((p) => p.type === "chunk");
+      if (m && m.hasWater && m.wIndices.length > 12) { found = m; at = [cx, cz]; }
+    }
+  }
+  check("found a chunk with inland water", !!found, "none in the first 1600 chunks");
+  if (found) {
+    const wp = found.wPositions as Float32Array;
+    const wn = found.wNormals as Float32Array;
+    const wd = found.wDepths as Float32Array;
+    const wi = found.wIndices as Uint32Array;
+    const quads = wi.length / 6;
+    console.log(`water chunk @${at}: ${quads} quads, ${wp.length / 3} verts, depths ${Math.min(...wd).toFixed(2)}..${Math.max(...wd).toFixed(2)}`);
+    check("water verts match quads", wp.length / 3 === quads * 4);
+    check("water indices in bounds", wi.every((i: number) => i < wp.length / 3));
+    check("water depths are positive", wd.every((d: number) => d > 0));
+    check("water positions finite", wp.every((v: number) => Number.isFinite(v)));
+    let bad = 0;
+    for (let t = 0; t < wi.length; t += 3) {
+      const a = wi[t] * 3, b = wi[t + 1] * 3, c = wi[t + 2] * 3;
+      const ux = wp[b] - wp[a], uy = wp[b + 1] - wp[a + 1], uz = wp[b + 2] - wp[a + 2];
+      const vx = wp[c] - wp[a], vy = wp[c + 1] - wp[a + 1], vz = wp[c + 2] - wp[a + 2];
+      const dot = (uy * vz - uz * vy) * wn[a] + (uz * vx - ux * vz) * wn[a + 1] + (ux * vy - uy * vx) * wn[a + 2];
+      if (dot <= 0) bad++;
+    }
+    check("water faces are wound front-facing", bad === 0, `${bad}/${wi.length / 3} inside-out`);
+    // per-column water must sit at or above the terrain it covers
+    let inconsistent = 0;
+    for (let i = 0; i < found.water.length; i++) {
+      const w = found.water[i] as number;
+      if (w === -32768) continue;
+      if (w < found.heights[i] - 0.001) inconsistent++;
+    }
+    check("water level never below its terrain", inconsistent === 0, `${inconsistent} columns`);
+  }
 }
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);

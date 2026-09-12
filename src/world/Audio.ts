@@ -98,6 +98,23 @@ export class SoundKit {
     this.burst(1800, 1.2, 0.3, 0.1, "bandpass");
   }
 
+  /**
+   * Wading: a step taken in water. Layered so it reads as a slosh plus the
+   * droplets it throws up, and gets splashier the shallower the water is.
+   */
+  wade(intensity: number, depth: number) {
+    const v = 0.16 * Math.min(1, intensity);
+    const shallow = 1 - Math.min(1, depth / 1.6); // ankle deep = splashy
+    // body of displaced water
+    this.burst(300 + shallow * 260, 0.7, 0.2 + shallow * 0.1, v * (0.9 + shallow * 0.5), "lowpass");
+    // droplets
+    this.burst(1500 + shallow * 900, 1.4, 0.16, v * (0.35 + shallow * 0.75), "bandpass");
+    if (Math.random() < 0.45) {
+      // a little "plop" for the foot leaving the surface
+      this.burst(620, 3.5, 0.1, v * 0.5, "bandpass");
+    }
+  }
+
   dispose() {
     this.ctx?.close();
     this.ctx = null;

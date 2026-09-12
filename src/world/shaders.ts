@@ -282,46 +282,237 @@ void main() {
 }
 `;
 
-/* ----------------------------------------------------------------- clouds */
+/* ------------------------------------------- rivers / glacial lake surfaces */
+
+export const SURF_VERT = /* glsl */ `
+precision highp float;
+attribute float aDepth;
+uniform float uTime;
+uniform float uFreezeLine;
+varying vec3 vWorld;
+varying float vDepth;
+
+void main() {
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  float ice = smoothstep(uFreezeLine, uFreezeLine + 16.0, wp.y);
+  float h = sin(wp.x * 0.62 + uTime * 1.15) * 0.045
+          + sin(wp.z * 0.83 - uTime * 0.95) * 0.038
+          + sin((wp.x + wp.z) * 1.9 + uTime * 2.1) * 0.018;
+  wp.y += h * (1.0 - ice) * smoothstep(0.2, 1.2, aDepth);
+  vWorld = wp.xyz;
+  vDepth = aDepth;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}
+`;
+
+export const SURF_FRAG = /* glsl */ `
+precision highp float;
+varying vec3 vWorld;
+varying float vDepth;
+
+uniform float uTime;
+uniform vec3 uCameraPos;
+uniform vec3 uSunDir;
+uniform vec3 uSunColor;
+uniform vec3 uZenith;
+uniform vec3 uHorizon;
+uniform vec3 uFogColor;
+uniform float uFogDensity;
+uniform float uFreezeLine;
+uniform vec3 uShallow;
+uniform vec3 uDeep;
+${SKY_FN}
+
+void main() {
+  float depth = vDepth;
+  vec3 V = normalize(uCameraPos - vWorld);
+
+  float w1 = cos(vWorld.x * 0.62 + uTime * 1.15) * 0.045 * 0.62;
+  float w2 = cos(vWorld.z * 0.83 - uTime * 0.95) * 0.038 * 0.83;
+  float w3 = cos((vWorld.x + vWorld.z) * 1.9 + uTime * 2.1) * 0.018 * 1.9;
+  float ice = smoothstep(uFreezeLine, uFreezeLine + 16.0, vWorld.y);
+  vec3 N = normalize(vec3(-(w1 + w3) * (1.0 - ice), 1.0, -(w2 + w3) * (1.0 - ice)));
+
+  vec3 R = reflect(-V, N);
+  R.y = abs(R.y) * 0.8 + 0.02;
+  vec3 refl = skyColor(R, uSunDir, uZenith, uHorizon, uSunColor);
+
+  // glacial flour: high alpine lakes read turquoise
+  float alt = smoothstep(70.0, 170.0, vWorld.y);
+  vec3 shallow = mix(uShallow, vec3(0.30, 0.62, 0.64), alt);
+  vec3 deep = mix(uDeep, vec3(0.055, 0.22, 0.32), alt);
+  vec3 body = mix(shallow, deep, smoothstep(0.6, 9.0, depth));
+  body *= 0.55 + 0.45 * max(uSunDir.y, 0.0);
+
+  float fres = 0.022 + 0.978 * pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 5.0);
+  vec3 col = mix(body, refl, clamp(fres, 0.0, 1.0));
+
+  vec3 H = normalize(uSunDir + V);
+  col += uSunColor * pow(max(dot(N, H), 0.0), 260.0) * 3.0 * smoothstep(-0.05, 0.2, uSunDir.y);
+
+  // shoreline foam
+  float edge = sin(depth * 5.0 - uTime * 1.6 + vWorld.x * 0.6 + vWorld.z * 0.45) * 0.5 + 0.5;
+  float foam = (1.0 - smoothstep(0.0, 1.0, depth)) * (0.45 + 0.55 * edge);
+  col = mix(col, vec3(0.94, 0.97, 1.0), clamp(foam, 0.0, 0.8));
+
+  // frozen high-altitude lakes
+  vec3 iceCol = vec3(0.80, 0.88, 0.94) * (0.5 + 0.5 * max(uSunDir.y, 0.0));
+  col = mix(col, iceCol, ice * 0.9);
+
+  float alpha = mix(0.32, 0.94, smoothstep(0.0, 2.4, depth));
+  alpha = max(alpha, clamp(foam, 0.0, 1.0) * 0.85);
+  alpha = mix(alpha, 1.0, clamp(fres, 0.0, 1.0) * 0.8);
+  alpha = mix(alpha, 0.97, ice);
+
+  float d = length(vWorld - uCameraPos);
+  float f = 1.0 - exp(-pow(d * uFogDensity, 2.0));
+  col = mix(col, uFogColor, clamp(f, 0.0, 1.0));
+  gl_FragColor = vec4(col, alpha);
+}
+`;
+
+/* ------------------------------------------------------------ volumetric sky */
 
 export const CLOUD_VERT = /* glsl */ `
-precision highp float;
-attribute float iAlpha;
-varying vec3 vNormalW;
-varying float vAlpha;
 varying vec3 vWorld;
 void main() {
-  vec4 wp = instanceMatrix * vec4(position, 1.0);
-  vWorld = (modelMatrix * wp).xyz;
-  vNormalW = normalize(mat3(instanceMatrix) * normal);
-  vAlpha = iAlpha;
-  gl_Position = projectionMatrix * viewMatrix * modelMatrix * wp;
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWorld = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
 }
 `;
 
 export const CLOUD_FRAG = /* glsl */ `
 precision highp float;
-varying vec3 vNormalW;
-varying float vAlpha;
+#define MAX_STEPS 48
+
 varying vec3 vWorld;
+
+uniform vec3 uCameraPos;
 uniform vec3 uSunDir;
 uniform vec3 uSunColor;
-uniform vec3 uTop;
-uniform vec3 uBottom;
+uniform vec3 uAmbient;
 uniform vec3 uFogColor;
-uniform vec3 uCameraPos;
 uniform float uFogDensity;
+uniform float uTime;
+uniform float uBase;
+uniform float uTop;
+uniform float uCoverage;
+uniform float uDensity;
+uniform float uSteps;
+uniform float uOctaves;
+uniform vec2 uWind;
+${SKY_FN}
+
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+float vnoise3(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  float n000 = hash13(i);
+  float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
+  float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
+  float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
+  float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
+  float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
+  float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
+  float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
+  return mix(
+    mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+    mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y),
+    f.z);
+}
+
+float fbm3(vec3 p) {
+  float a = 0.5;
+  float s = 0.0;
+  float n = 0.0;
+  for (int i = 0; i < 6; i++) {
+    if (float(i) >= uOctaves) break;
+    s += a * vnoise3(p);
+    n += a;
+    p *= 2.07;
+    a *= 0.5;
+  }
+  return s / max(n, 0.0001);
+}
+
+float cloudAt(vec3 p, float shape) {
+  if (shape <= 0.001) return 0.0;
+  return max((fbm3(p) + uCoverage - 1.0) * shape, 0.0);
+}
 
 void main() {
-  vec3 N = normalize(vNormalW);
-  float up = N.y * 0.5 + 0.5;
-  vec3 col = mix(uBottom, uTop, pow(up, 0.8));
-  float sun = max(dot(N, uSunDir), 0.0);
-  col += uSunColor * sun * 0.35;
-  float dist = length(vWorld - uCameraPos);
-  float fogF = 1.0 - exp(-pow(dist * uFogDensity * 0.55, 2.0));
-  col = mix(col, uFogColor, clamp(fogF, 0.0, 0.85));
-  float a = vAlpha * (1.0 - smoothstep(700.0, 1050.0, dist));
-  gl_FragColor = vec4(col, a);
+  vec3 ro = uCameraPos;
+  vec3 rd = normalize(vWorld - uCameraPos);
+  float thick = max(uTop - uBase, 1.0);
+
+  float t0;
+  float t1;
+  if (abs(rd.y) < 0.0006) {
+    if (ro.y < uBase || ro.y > uTop) discard;
+    t0 = 0.0;
+    t1 = 2600.0;
+  } else {
+    float ta = (uBase - ro.y) / rd.y;
+    float tb = (uTop - ro.y) / rd.y;
+    t0 = min(ta, tb);
+    t1 = max(ta, tb);
+  }
+  t0 = max(t0, 0.0);
+  t1 = min(t1, 2600.0);
+  t1 = min(t1, t0 + 1500.0); // keep step length sane near the horizon
+  if (t1 <= t0) discard;
+
+  vec3 wind = vec3(uWind.x, 0.0, uWind.y) * uTime;
+  float steps = clamp(uSteps, 4.0, float(MAX_STEPS));
+  float dt = (t1 - t0) / steps;
+  float jitter = hash13(vec3(gl_FragCoord.xy, floor(uTime * 30.0)));
+  float t = t0 + dt * jitter;
+
+  float trans = 1.0;
+  vec3 col = vec3(0.0);
+
+  for (int i = 0; i < MAX_STEPS; i++) {
+    if (float(i) >= steps || trans < 0.02) break;
+    vec3 p = ro + rd * t;
+    float hn = clamp((p.y - uBase) / thick, 0.0, 1.0);
+    float shape = smoothstep(0.0, 0.32, hn) * smoothstep(1.0, 0.62, hn);
+    vec3 sp = (p + wind) * 0.0072;
+    float d = cloudAt(sp, shape);
+    if (d > 0.002) {
+      float ls = 0.0;
+      vec3 lp = p + wind;
+      for (int j = 0; j < 4; j++) {
+        lp += uSunDir * (thick * 0.32);
+        float lhn = clamp((lp.y - uBase) / thick, 0.0, 1.0);
+        float lshape = smoothstep(0.0, 0.32, lhn) * smoothstep(1.0, 0.62, lhn);
+        ls += cloudAt(lp * 0.0072, lshape);
+      }
+      float sunT = exp(-ls * 1.6);
+      float powder = 1.0 - exp(-d * 6.0);
+      vec3 lit = uAmbient + uSunColor * (0.35 + 0.9 * sunT) * mix(1.0, powder, 0.4);
+      float a = 1.0 - exp(-d * dt * uDensity);
+      col += trans * a * lit;
+      trans *= 1.0 - a;
+    }
+    t += dt;
+  }
+
+  float alpha = 1.0 - trans;
+  if (alpha < 0.006) discard;
+  col /= max(alpha, 0.0001); // the accumulation above is premultiplied
+
+  float dist = length(vWorld - ro);
+  float f = clamp(1.0 - exp(-pow(dist * uFogDensity * 0.55, 2.0)), 0.0, 1.0);
+  col = mix(col, uFogColor, f);
+  // fade the deck out towards the horizon so it melts into the sky
+  alpha *= 1.0 - smoothstep(1500.0, 2500.0, dist);
+  gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
 }
 `;

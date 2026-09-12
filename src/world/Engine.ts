@@ -7,14 +7,29 @@ import {
   GRASS_VERT,
   SKY_FRAG,
   SKY_VERT,
+  SURF_FRAG,
+  SURF_VERT,
   WATER_FRAG,
   WATER_VERT,
 } from "./shaders";
 import { SoundKit } from "./Audio";
 import { requestSteer, type LookMode } from "./steering";
-import { clamp, fbm, hash2 } from "./noise";
+import { clamp, hash2 } from "./noise";
 import { bladeDensity, emptyBlade, makeBlade } from "./grass";
-import { BLOCK, CHUNK, HALF, SEA_LEVEL, WORLD_SIZE, heightAt } from "./worldgen";
+import { TREE_CONIFER, foliageTint } from "./scenery";
+/** scenery record strides, must match the worker's packing */
+const TREE_STRIDE = 8;
+const ROCK_STRIDE = 7;
+import {
+  BLOCK,
+  CHUNK,
+  FREEZE_LINE,
+  HALF,
+  NO_WATER,
+  SEA_LEVEL,
+  WORLD_SIZE,
+  heightAt,
+} from "./worldgen";
 
 export type Quality = "low" | "medium" | "high" | "ultra";
 export type { LookMode };
@@ -33,20 +48,46 @@ export interface Stats {
   grounded: boolean;
   /** how the camera is being steered right now */
   look: LookMode;
+  quality: Quality;
 }
 
 
-const QUALITY: Record<Quality, { radius: number; grassRange: number; grassPerBlock: number; shadow: number; pixelRatio: number }> = {
-  low: { radius: 6, grassRange: 22, grassPerBlock: 2, shadow: 1024, pixelRatio: 1 },
-  medium: { radius: 9, grassRange: 30, grassPerBlock: 3, shadow: 1536, pixelRatio: 1.25 },
-  high: { radius: 12, grassRange: 38, grassPerBlock: 4, shadow: 2048, pixelRatio: 1.5 },
-  ultra: { radius: 15, grassRange: 46, grassPerBlock: 5, shadow: 2048, pixelRatio: 2 },
+interface QualityPreset {
+  radius: number;
+  grassRange: number;
+  grassPerBlock: number;
+  shadow: number;
+  pixelRatio: number;
+  /** scenery (trees / boulders) streaming radius in blocks */
+  vegRange: number;
+  /** raymarch samples through the cloud deck */
+  cloudSteps: number;
+  cloudOctaves: number;
+}
+
+const QUALITY: Record<Quality, QualityPreset> = {
+  low: { radius: 8, grassRange: 22, grassPerBlock: 2, shadow: 1024, pixelRatio: 1, vegRange: 70, cloudSteps: 12, cloudOctaves: 3 },
+  medium: { radius: 11, grassRange: 30, grassPerBlock: 3, shadow: 1536, pixelRatio: 1.25, vegRange: 90, cloudSteps: 18, cloudOctaves: 3 },
+  high: { radius: 13, grassRange: 38, grassPerBlock: 4, shadow: 2048, pixelRatio: 1.5, vegRange: 110, cloudSteps: 26, cloudOctaves: 4 },
+  ultra: { radius: 15, grassRange: 48, grassPerBlock: 5, shadow: 2048, pixelRatio: 2, vegRange: 130, cloudSteps: 34, cloudOctaves: 5 },
 };
+
+/** cloud deck: high enough to feel like weather, low enough for the sky-piercing ranges */
+const CLOUD_BASE = 168;
+const CLOUD_TOP = 236;
 
 interface ChunkRec {
   mesh: THREE.Mesh;
+  /** inland water surface (rivers / lakes) – absent for most chunks */
+  water: THREE.Mesh | null;
   heights: Int16Array;
+  /** per-column water surface, NO_WATER when dry */
+  waterLevels: Int16Array;
   types: Uint8Array;
+  /** per-tree records from the worker: x, y, species, height, trunkR, canopy, rot */
+  trees: Float32Array;
+  /** per-boulder records: x, y, size, rot, sink, squash */
+  rocks: Float32Array;
   cx: number;
   cz: number;
 }
@@ -64,11 +105,15 @@ export class Engine {
   onReady: () => void = () => {};
   onStats: (s: Stats) => void = () => {};
   onError: (message: string) => void = () => {};
+  /** chat/command console */
+  onQuality: (q: Quality) => void = () => {};
+  onConsole: (open: boolean) => void = () => {};
+  onConsoleLine: (text: string) => void = () => {};
   onMinimap: (url: string) => void = () => {};
   onLockChange: (locked: boolean) => void = () => {};
 
-  quality: Quality = "high";
-  private q = QUALITY.high;
+  quality: Quality = "ultra";
+  private q: QualityPreset = QUALITY.ultra;
 
   // world
   private chunks = new Map<string, ChunkRec>();
@@ -81,6 +126,7 @@ export class Engine {
   private terrainMat!: THREE.MeshLambertMaterial;
   private heightTex!: THREE.DataTexture;
   private heightData: Uint8Array | null = null;
+  private waterMapData: Uint8Array | null = null;
 
   // visuals
   private sky!: THREE.Mesh;
@@ -90,18 +136,26 @@ export class Engine {
   private ambient!: THREE.AmbientLight;
   private water!: THREE.Mesh;
   private waterMat!: THREE.ShaderMaterial;
+  /** rivers + glacial lakes, drawn per chunk */
+  private surfMat!: THREE.ShaderMaterial;
   private grass!: THREE.Mesh;
   private grassMat!: THREE.ShaderMaterial;
   private grassGeo!: THREE.InstancedBufferGeometry;
   private grassCapacity = 0;
   private lastGrassPos = new THREE.Vector3(1e9, 0, 1e9);
-  private clouds!: THREE.InstancedMesh;
+  /** raymarched cloud deck: one big slab the camera lives inside */
+  private clouds!: THREE.Mesh;
   private cloudMat!: THREE.ShaderMaterial;
-  private cloudAlpha!: THREE.InstancedBufferAttribute;
-  private cloudCell = 20;
-  private cloudGrid = 46;
-  private lastCloudKey = "";
   private cloudDrift = 0;
+
+  // scenery
+  private trunks!: THREE.InstancedMesh;
+  private cones!: THREE.InstancedMesh;
+  private blobs!: THREE.InstancedMesh;
+  private boulders!: THREE.InstancedMesh;
+  private vegUniforms = { uTime: { value: 0 }, uWind: { value: 0.6 } };
+  private lastVegPos = new THREE.Vector3(1e9, 0, 1e9);
+  private vegCap = { trunk: 7000, cone: 14000, blob: 14000, rock: 4000 };
 
   // player
   pos = new THREE.Vector3(0, 80, 0);
@@ -124,16 +178,27 @@ export class Engine {
   private eyeHeight = 1.72;
   private fly = false;
   private fovTarget = 74;
+  private fovBase = 74;
   private lastStepIdx = 0;
   private wasInWater = false;
+  private headUnder = false;
   sound = new SoundKit();
   private curFov = 74;
   private mouseSensitivity = 0.0022;
 
   // time
   timeOfDay = 0.33;
-  timeSpeed = 0.004; // day fraction per second
+  /** normal day fraction per second; /freeze and /timescale change the multiplier */
+  static readonly NORMAL_TIME_SPEED = 0.004;
+  timeSpeed = 0.004;
+  /** multiplier applied to timeSpeed (0 = frozen, 1 = normal) */
+  timeScale = 1;
   private elapsed = 0;
+
+  // input
+  consoleOpen = false;
+  /** multiplier for walking / sprinting speed, settable via /speed */
+  walkScale = 1;
 
   private raf = 0;
   private frames = 0;
@@ -161,7 +226,7 @@ export class Engine {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-    this.camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.08, 2400);
+    this.camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.08, 2600);
 
     this.scene.fog = new THREE.FogExp2(0x9fc0e0, 0.0022);
 
@@ -169,7 +234,9 @@ export class Engine {
     this.buildSky();
     this.buildTerrainMaterial();
     this.buildWater();
+    this.buildSurfaceWater();
     this.buildGrass();
+    this.buildVegetation();
     this.buildClouds();
     this.bindEvents();
     this.spawnWorkers();
@@ -360,33 +427,127 @@ export class Engine {
     this.scene.add(this.grass);
   }
 
-  private buildClouds() {
-    const box = new THREE.BoxGeometry(1, 1, 1);
-    const count = this.cloudGrid * this.cloudGrid;
-    this.cloudMat = new THREE.ShaderMaterial({
+  /** rivers, glacial lakes, tarns */
+  private buildSurfaceWater() {
+    this.surfMat = new THREE.ShaderMaterial({
       uniforms: {
+        uTime: { value: 0 },
+        uCameraPos: { value: new THREE.Vector3() },
         uSunDir: { value: new THREE.Vector3(0, 1, 0) },
         uSunColor: { value: new THREE.Color(0xfff0d0) },
-        uTop: { value: new THREE.Color(0xffffff) },
-        uBottom: { value: new THREE.Color(0x9fb0cc) },
+        uZenith: { value: new THREE.Color(0x2f6ed0) },
+        uHorizon: { value: new THREE.Color(0xcfe2f5) },
         uFogColor: { value: new THREE.Color(0x9fc0e0) },
-        uFogDensity: { value: 0.0012 },
+        uFogDensity: { value: 0.0027 },
+        uFreezeLine: { value: FREEZE_LINE },
+        uShallow: { value: new THREE.Color(0x3e9aa4) },
+        uDeep: { value: new THREE.Color(0x0a2740) },
+      },
+      vertexShader: SURF_VERT,
+      fragmentShader: SURF_FRAG,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+  }
+
+  /**
+   * Cloud deck: not boxes any more. A single huge slab the camera lives inside;
+   * the fragment shader raymarches 3D noise through it, so the clouds behave
+   * like lit fog and mountains can poke straight through.
+   */
+  private buildClouds() {
+    this.cloudMat = new THREE.ShaderMaterial({
+      uniforms: {
         uCameraPos: { value: new THREE.Vector3() },
+        uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+        uSunColor: { value: new THREE.Color(0xfff0d0) },
+        uAmbient: { value: new THREE.Color(0x8fa6c4) },
+        uFogColor: { value: new THREE.Color(0x9fc0e0) },
+        uFogDensity: { value: 0.0027 },
+        uTime: { value: 0 },
+        uBase: { value: CLOUD_BASE },
+        uTop: { value: CLOUD_TOP },
+        uCoverage: { value: 0.46 },
+        uDensity: { value: 0.16 },
+        uSteps: { value: this.q.cloudSteps },
+        uOctaves: { value: this.q.cloudOctaves },
+        uWind: { value: new THREE.Vector2(1.6, 0.9) },
       },
       vertexShader: CLOUD_VERT,
       fragmentShader: CLOUD_FRAG,
       transparent: true,
-      depthWrite: true,
+      depthWrite: false,
+      side: THREE.BackSide,
     });
-    this.clouds = new THREE.InstancedMesh(box, this.cloudMat, count);
-    this.clouds.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    this.cloudAlpha = new THREE.InstancedBufferAttribute(new Float32Array(count), 1);
-    this.cloudAlpha.setUsage(THREE.DynamicDrawUsage);
-    box.setAttribute("iAlpha", this.cloudAlpha);
+    // trigger volume: big enough to cover the view, small enough to stay
+    // inside the far plane
+    const span = 2600;
+    const geo = new THREE.BoxGeometry(span, CLOUD_TOP - CLOUD_BASE, span);
+    this.clouds = new THREE.Mesh(geo, this.cloudMat);
     this.clouds.frustumCulled = false;
-    this.clouds.count = 0;
-    this.clouds.renderOrder = 5;
+    this.clouds.renderOrder = 6;
     this.scene.add(this.clouds);
+  }
+
+  /** vegetation material: lambert + a wind sway injected into the vertex stage */
+  private vegMaterial(sway: number) {
+    const mat = new THREE.MeshLambertMaterial({ vertexColors: false });
+    const u = this.vegUniforms;
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = u.uTime;
+      shader.uniforms.uWind = u.uWind;
+      shader.uniforms.uSway = { value: sway };
+      shader.vertexShader =
+        "uniform float uTime;\nuniform float uWind;\nuniform float uSway;\n" +
+        shader.vertexShader.replace(
+          "#include <begin_vertex>",
+          `#include <begin_vertex>
+           #ifdef USE_INSTANCING
+             vec3 iOrigin = vec3(instanceMatrix[3][0], instanceMatrix[3][1], instanceMatrix[3][2]);
+           #else
+             vec3 iOrigin = vec3(0.0);
+           #endif
+           float phase = iOrigin.x * 0.13 + iOrigin.z * 0.17;
+           float gust = 0.55 + 0.45 * sin(uTime * 0.6 + iOrigin.x * 0.01 + iOrigin.z * 0.013);
+           float amp = uSway * uWind * gust * max(transformed.y, 0.0);
+           transformed.x += sin(uTime * 1.15 + phase) * amp;
+           transformed.z += cos(uTime * 0.93 + phase * 1.3) * amp * 0.7;`,
+        );
+    };
+    mat.customProgramCacheKey = () => `veg-${sway}`;
+    return mat;
+  }
+
+  private buildVegetation() {
+    const trunkGeo = new THREE.CylinderGeometry(0.72, 1, 1, 6, 1, false);
+    trunkGeo.translate(0, 0.5, 0);
+    const coneGeo = new THREE.ConeGeometry(1, 1, 7);
+    coneGeo.translate(0, 0.5, 0);
+    const blobGeo = new THREE.IcosahedronGeometry(1, 0);
+    const rockGeo = new THREE.IcosahedronGeometry(1, 0);
+
+    this.trunks = new THREE.InstancedMesh(trunkGeo, this.vegMaterial(0.05), this.vegCap.trunk);
+    this.cones = new THREE.InstancedMesh(coneGeo, this.vegMaterial(0.14), this.vegCap.cone);
+    this.blobs = new THREE.InstancedMesh(blobGeo, this.vegMaterial(0.1), this.vegCap.blob);
+    this.boulders = new THREE.InstancedMesh(rockGeo, this.vegMaterial(0.0), this.vegCap.rock);
+
+    for (const m of [this.trunks, this.cones, this.blobs, this.boulders]) {
+      m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      m.instanceColor = new THREE.InstancedBufferAttribute(
+        new Float32Array(m.instanceMatrix.count * 3).fill(1),
+        3,
+      );
+      m.count = 0;
+      m.frustumCulled = false;
+      m.castShadow = false;
+      m.receiveShadow = true;
+      this.scene.add(m);
+    }
+    this.cones.castShadow = true;
+    this.blobs.castShadow = true;
+    this.trunks.castShadow = true;
+    this.boulders.castShadow = true;
   }
 
   private spawnWorkers() {
@@ -410,11 +571,12 @@ export class Engine {
     if (this.disposed) return;
     const m = ev.data;
     if (m.type === "progress") {
-      this.onProgress(m.value * 0.45, "生成 2048 × 2048 地形高度场…");
+      this.onProgress(m.value * 0.45, `生成 ${WORLD_SIZE} × ${WORLD_SIZE} 地形高度场…`);
       return;
     }
     if (m.type === "heightmap") {
       this.heightData = m.data as Uint8Array;
+      this.waterMapData = m.water as Uint8Array;
       (this.heightTex.image.data as Uint8Array).set(this.heightData!);
       this.heightTex.needsUpdate = true;
       this.buildMinimap();
@@ -457,10 +619,32 @@ export class Engine {
     mesh.receiveShadow = true;
     mesh.castShadow = false;
     this.scene.add(mesh);
+
+    let waterMesh: THREE.Mesh | null = null;
+    if (m.wIndices && m.wIndices.length) {
+      const wgeo = new THREE.BufferGeometry();
+      wgeo.setAttribute("position", new THREE.BufferAttribute(m.wPositions, 3));
+      wgeo.setAttribute("normal", new THREE.BufferAttribute(m.wNormals, 3));
+      wgeo.setAttribute("aDepth", new THREE.BufferAttribute(m.wDepths, 1));
+      wgeo.setIndex(new THREE.BufferAttribute(m.wIndices, 1));
+      wgeo.boundingSphere = new THREE.Sphere(
+        new THREE.Vector3(ox + CHUNK / 2, (minH + maxH) * 0.5, oz + CHUNK / 2),
+        Math.sqrt(CHUNK * CHUNK * 0.5 + half * half) + 2,
+      );
+      waterMesh = new THREE.Mesh(wgeo, this.surfMat);
+      waterMesh.matrixAutoUpdate = false;
+      waterMesh.renderOrder = 9;
+      this.scene.add(waterMesh);
+    }
+
     this.chunks.set(m.key, {
       mesh,
+      water: waterMesh,
       heights: m.heights,
+      waterLevels: m.water,
       types: m.types,
+      trees: m.trees,
+      rocks: m.rocks,
       cx: m.cx,
       cz: m.cz,
     });
@@ -470,6 +654,9 @@ export class Engine {
     const dz = oz + CHUNK / 2 - this.pos.z;
     if (dx * dx + dz * dz < (this.q.grassRange + CHUNK) ** 2) {
       this.lastGrassPos.set(1e9, 0, 1e9);
+    }
+    if (dx * dx + dz * dz < (this.q.vegRange + CHUNK) ** 2) {
+      this.lastVegPos.set(1e9, 0, 1e9);
     }
   }
 
@@ -522,6 +709,10 @@ export class Engine {
       if (d > R + 2.5) {
         this.scene.remove(rec.mesh);
         rec.mesh.geometry.dispose();
+        if (rec.water) {
+          this.scene.remove(rec.water);
+          rec.water.geometry.dispose();
+        }
         this.chunks.delete(key);
       } else {
         const shouldCast = d <= 3;
@@ -543,6 +734,31 @@ export class Engine {
       return rec.heights[lz * CHUNK + lx];
     }
     return heightAt(fx, fz);
+  }
+
+  /** the 3x3 chunks around the player exist, so there is ground underfoot */
+  private localChunksReady(): boolean {
+    const pcx = Math.floor(this.pos.x / CHUNK);
+    const pcz = Math.floor(this.pos.z / CHUNK);
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!this.chunks.has(`${pcx + dx},${pcz + dz}`)) return false;
+      }
+    }
+    return true;
+  }
+
+  /** water surface at a column (ocean, river, lake) or NO_WATER */
+  waterAt(x: number, z: number): number {
+    const fx = Math.floor(x);
+    const fz = Math.floor(z);
+    const cx = Math.floor(fx / CHUNK);
+    const cz = Math.floor(fz / CHUNK);
+    const rec = this.chunks.get(`${cx},${cz}`);
+    if (!rec) return NO_WATER;
+    const lx = fx - cx * CHUNK;
+    const lz = fz - cz * CHUNK;
+    return rec.waterLevels[lz * CHUNK + lx];
   }
 
   typeAtWorld(x: number, z: number): number {
@@ -596,6 +812,17 @@ export class Engine {
         img.data[o + 1] = clamp(g * shade, 0, 255);
         img.data[o + 2] = clamp(b * shade, 0, 255);
         img.data[o + 3] = 255;
+
+        // rivers and lakes on top of the terrain shading
+        if (this.waterMapData) {
+          const w = this.waterMapData[sy * HM_RES + sx];
+          if (w > 0 && w > h && h > SEA_LEVEL - 1) {
+            const deep = clamp((w - h) / 26, 0, 1);
+            img.data[o] = clamp(30 + (1 - deep) * 70, 0, 255);
+            img.data[o + 1] = clamp(96 + (1 - deep) * 74, 0, 255);
+            img.data[o + 2] = clamp(150 + (1 - deep) * 46, 0, 255);
+          }
+        }
       }
     }
     ctx.putImageData(img, 0, 0);
@@ -611,6 +838,8 @@ export class Engine {
       const gz = Math.floor(hash2(i, 91) * HM_RES);
       const h = this.heightData[gz * HM_RES + gx];
       if (h < SEA_LEVEL + 3 || h > SEA_LEVEL + 22) continue;
+      // never spawn in a river / lake
+      if (this.waterMapData && this.waterMapData[gz * HM_RES + gx] > h) continue;
       // want mountains within ~350 blocks
       let mountain = 0;
       for (let s = 0; s < 24; s++) {
@@ -686,52 +915,155 @@ export class Engine {
   /* ---------------------------------------------------------------- clouds */
 
   private updateClouds(dt: number) {
+    // wind moves the noise field; the slab itself just follows the camera
     this.cloudDrift += dt * 1.35;
-    const cell = this.cloudCell;
-    const G = this.cloudGrid;
-    const originX = Math.round((this.pos.x - this.cloudDrift) / cell);
-    const originZ = Math.round(this.pos.z / cell);
-    const key = `${originX},${originZ}`;
+    this.clouds.position.set(this.pos.x, (CLOUD_BASE + CLOUD_TOP) * 0.5, this.pos.z);
+    const cu = this.cloudMat.uniforms;
+    cu.uCameraPos.value.copy(this.camera.position);
+    cu.uTime.value = this.elapsed + this.cloudDrift;
+    cu.uWind.value.set(1.6 + Math.sin(this.elapsed * 0.05) * 0.6, 0.9);
+  }
+
+  /**
+   * Scenery instances are resolved once per chunk inside the worker; here we
+   * only compose matrices for the chunks around the player, so re-scattering
+   * costs a few milliseconds instead of a full noise pass over the area.
+   */
+  private rebuildVegetation() {
+    const range = this.q.vegRange;
+    const r2 = range * range;
+    const pcx = Math.floor(this.pos.x / CHUNK);
+    const pcz = Math.floor(this.pos.z / CHUNK);
+    const span = Math.ceil(range / CHUNK);
+
     const mat = new THREE.Matrix4();
-    if (key !== this.lastCloudKey) {
-      this.lastCloudKey = key;
-      let n = 0;
-      const alphas = this.cloudAlpha.array as Float32Array;
-      for (let j = 0; j < G; j++) {
-        for (let i = 0; i < G; i++) {
-          const ci = originX + i - G / 2;
-          const cj = originZ + j - G / 2;
-          const nx = ci * cell * 0.0022;
-          const nz = cj * cell * 0.0022;
-          let d = fbm(nx, nz, 4) * 0.5 + 0.5;
-          d += fbm(nx * 3.1 + 40, nz * 3.1 - 20, 3) * 0.16;
-          if (d < 0.54) continue;
-          const dens = Math.min(1, (d - 0.54) / 0.26);
-          const hRand = hash2(ci, cj);
-          const sy = 4 + dens * 11 + hRand * 4;
-          const sx = cell * (0.85 + hash2(ci * 3, cj * 7) * 0.3);
-          const sz = cell * (0.85 + hash2(ci * 11, cj * 5) * 0.3);
-          const y = 168 + Math.sin(ci * 0.7) * 5 + Math.cos(cj * 0.5) * 5 + dens * 8;
-          mat.makeScale(sx, sy, sz);
-          mat.setPosition(ci * cell, y, cj * cell);
-          this.clouds.setMatrixAt(n, mat);
-          alphas[n] = 0.82 + dens * 0.18;
-          n++;
-          if (n >= G * G) break;
+    const quat = new THREE.Quaternion();
+    const euler = new THREE.Euler();
+    const vpos = new THREE.Vector3();
+    const scl = new THREE.Vector3();
+    const color = new THREE.Color();
+    const cap = this.vegCap;
+    let nTrunk = 0, nCone = 0, nBlob = 0, nRock = 0;
+
+    for (let dz = -span; dz <= span; dz++) {
+      for (let dx = -span; dx <= span; dx++) {
+        const rec = this.chunks.get(`${pcx + dx},${pcz + dz}`);
+        if (!rec) continue;
+
+        const trees = rec.trees;
+        for (let i = 0; i < trees.length; i += TREE_STRIDE) {
+          const x = trees[i];
+          const z = trees[i + 1];
+          const ddx = x - this.pos.x;
+          const ddz = z - this.pos.z;
+          if (ddx * ddx + ddz * ddz > r2) continue;
+          const ground = trees[i + 2];
+          const species = trees[i + 3];
+          const height = trees[i + 4];
+          const trunkR = trees[i + 5];
+          const canopy = trees[i + 6];
+          const rot = trees[i + 7];
+          const base = ground - 0.2;
+          const tint = foliageTint(x, z);
+
+          if (nTrunk < cap.trunk) {
+            euler.set(0, rot, 0);
+            quat.setFromEuler(euler);
+            vpos.set(x, base, z);
+            scl.set(trunkR, height * 0.62, trunkR);
+            mat.compose(vpos, quat, scl);
+            this.trunks.setMatrixAt(nTrunk, mat);
+            const bark = 0.15 + tint * 0.1;
+            color.setRGB(bark, bark * 0.76, bark * 0.52);
+            this.trunks.setColorAt(nTrunk, color);
+            nTrunk++;
+          }
+
+          if (species === TREE_CONIFER) {
+            for (let k = 0; k < 3 && nCone < cap.cone; k++) {
+              const f = k / 3;
+              const w = canopy * (1.55 - f * 0.6);
+              const hh = height * (0.54 - f * 0.1);
+              euler.set(0, rot + k * 0.7, 0);
+              quat.setFromEuler(euler);
+              vpos.set(x, base + height * (0.22 + f * 0.27), z);
+              scl.set(w, hh, w);
+              mat.compose(vpos, quat, scl);
+              this.cones.setMatrixAt(nCone, mat);
+              const g = 0.15 + tint * 0.12 + f * 0.03;
+              color.setRGB(g * 0.6, g, g * 0.55);
+              this.cones.setColorAt(nCone, color);
+              nCone++;
+            }
+          } else {
+            for (let k = 0; k < 3 && nBlob < cap.blob; k++) {
+              const a = hash2(x * 3 + k, z * 7 - k) * Math.PI * 2;
+              const rad = k === 0 ? 0 : canopy * 0.5;
+              const w = canopy * (k === 0 ? 1 : 0.7);
+              euler.set(hash2(x + k, z) * 0.5, a, hash2(x, z + k) * 0.5);
+              quat.setFromEuler(euler);
+              vpos.set(
+                x + Math.cos(a) * rad,
+                base + height * (k === 0 ? 0.78 : 0.66),
+                z + Math.sin(a) * rad,
+              );
+              scl.set(w, w * 0.84, w);
+              mat.compose(vpos, quat, scl);
+              this.blobs.setMatrixAt(nBlob, mat);
+              const g = 0.19 + tint * 0.15;
+              color.setRGB(g * 0.7, g, g * 0.44);
+              this.blobs.setColorAt(nBlob, color);
+              nBlob++;
+            }
+          }
+        }
+
+        const rocks = rec.rocks;
+        for (let i = 0; i < rocks.length; i += ROCK_STRIDE) {
+          const x = rocks[i];
+          const z = rocks[i + 1];
+          const ddx = x - this.pos.x;
+          const ddz = z - this.pos.z;
+          if (ddx * ddx + ddz * ddz > r2) continue;
+          if (nRock >= cap.rock) break;
+          const ground = rocks[i + 2];
+          const size = rocks[i + 3];
+          const rot = rocks[i + 4];
+          const sink = rocks[i + 5];
+          const squash = rocks[i + 6];
+          euler.set(hash2(x * 5, z) * 0.5, rot, hash2(x, z * 3) * 0.5);
+          quat.setFromEuler(euler);
+          vpos.set(x, ground - size * sink, z);
+          scl.set(size, size * squash, size * 0.9);
+          mat.compose(vpos, quat, scl);
+          this.boulders.setMatrixAt(nRock, mat);
+          const g = 0.27 + hash2(x * 7, z * 11) * 0.12;
+          color.setRGB(g, g * 0.98, g * 0.94);
+          this.boulders.setColorAt(nRock, color);
+          nRock++;
         }
       }
-      this.clouds.count = n;
-      this.clouds.instanceMatrix.needsUpdate = true;
-      this.cloudAlpha.needsUpdate = true;
     }
-    this.clouds.position.x = this.cloudDrift;
-    this.clouds.position.z = Math.sin(this.cloudDrift * 0.03) * 6;
+
+    for (const [mesh, n] of [
+      [this.trunks, nTrunk],
+      [this.cones, nCone],
+      [this.blobs, nBlob],
+      [this.boulders, nRock],
+    ] as Array<[THREE.InstancedMesh, number]>) {
+      mesh.count = n;
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    }
+    this.vegUniforms.uTime.value = this.elapsed;
+    this.lastVegPos.copy(this.pos);
   }
 
   /* ------------------------------------------------------------ atmosphere */
 
   private updateSky(dt: number) {
-    this.timeOfDay = (this.timeOfDay + this.timeSpeed * dt) % 1;
+    this.timeOfDay = (this.timeOfDay + this.timeSpeed * this.timeScale * dt) % 1;
+    if (this.timeOfDay < 0) this.timeOfDay += 1;
     const a = (this.timeOfDay - 0.25) * Math.PI * 2;
     const sunDir = new THREE.Vector3(Math.cos(a) * 0.86, Math.sin(a) * 0.86, -0.28).normalize();
     const e = sunDir.y;
@@ -772,7 +1104,7 @@ export class Engine {
     this.hemi.groundColor.set(0x3a4a2e).lerp(new THREE.Color(0x0a0f1a), nightF);
     this.ambient.intensity = 0.1 + dayT * 0.16;
 
-    const submerged = this.pos.y < SEA_LEVEL;
+    const submerged = this.headUnder || this.pos.y < SEA_LEVEL;
     const fog = this.scene.fog as THREE.FogExp2;
     const fogCol = submerged
       ? new THREE.Color(0x12506b).lerp(new THREE.Color(0x04121d), nightF * 0.7)
@@ -807,10 +1139,29 @@ export class Engine {
     const cu = this.cloudMat.uniforms;
     cu.uSunDir.value.copy(sunDir);
     cu.uSunColor.value.copy(sunCol);
-    cu.uTop.value.set(0xffffff).lerp(new THREE.Color(0xffd0a0), duskT * 0.6).lerp(new THREE.Color(0x1b2338), nightF * 0.85);
-    cu.uBottom.value.set(0xa8bcd8).lerp(new THREE.Color(0xc98a72), duskT * 0.5).lerp(new THREE.Color(0x0f1524), nightF * 0.85);
     cu.uFogColor.value.copy(fogCol);
+    cu.uFogDensity.value = fog.density;
     cu.uCameraPos.value.copy(this.camera.position);
+    cu.uTime.value = this.elapsed;
+    // clouds are lit by the sky above and bounced light below; at night they go cold
+    cu.uAmbient.value
+      .copy(horizon)
+      .multiplyScalar(0.34 + dayT * 0.42)
+      .add(new THREE.Color(0x0a1020).multiplyScalar(nightF * 0.5));
+
+    const su = this.surfMat.uniforms;
+    su.uSunDir.value.copy(sunDir);
+    su.uSunColor.value.copy(sunCol);
+    su.uZenith.value.copy(zenith);
+    su.uHorizon.value.copy(horizon);
+    su.uFogColor.value.copy(fogCol);
+    su.uFogDensity.value = fog.density;
+    su.uTime.value = this.elapsed;
+    su.uCameraPos.value.copy(this.camera.position);
+    su.uShallow.value.set(0x3e9aa4).lerp(new THREE.Color(0x0d2b3a), nightF * 0.8);
+    su.uDeep.value.set(0x07243d).lerp(new THREE.Color(0x02101c), nightF);
+
+    this.vegUniforms.uWind.value = 0.45 + Math.sin(this.elapsed * 0.11) * 0.25 + Math.sin(this.elapsed * 0.037) * 0.14;
     void dt;
   }
 
@@ -837,6 +1188,25 @@ export class Engine {
   };
 
   private onKeyDown = (e: KeyboardEvent) => {
+    // command console: slash or enter opens it, escape closes it again
+    const opensConsole =
+      e.code === "Slash" ||
+      e.code === "NumpadDivide" ||
+      e.code === "Enter" ||
+      e.code === "NumpadEnter" ||
+      e.code === "KeyT";
+    if (opensConsole && !this.consoleOpen) {
+      e.preventDefault();
+      this.openConsole();
+      return;
+    }
+    if (e.code === "Escape" && this.consoleOpen) {
+      e.preventDefault();
+      this.closeConsole();
+      return;
+    }
+    if (this.consoleOpen) return; // typing, not playing
+
     this.keys.add(e.code);
     if (e.code === "Escape" && this.lookMode === "drag") {
       this.exitLook();
@@ -844,14 +1214,12 @@ export class Engine {
     }
     if (e.code === "KeyF") this.fly = !this.fly;
     if (e.code === "KeyM") this.sound.enabled = !this.sound.enabled;
-    if (e.code === "KeyT") {
-      this.timeSpeed = this.timeSpeed === 0 ? 0.004 : this.timeSpeed === 0.004 ? 0.03 : 0;
-    }
     if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
   };
   private onKeyUp = (e: KeyboardEvent) => this.keys.delete(e.code);
 
   private onPointerLock = () => {
+    if (this.consoleOpen) return; // we released the lock to let the player type
     const locked = document.pointerLockElement === this.canvas;
     if (locked) {
       this.lookMode = "pointer";
@@ -874,7 +1242,7 @@ export class Engine {
   /* --- fallback steering: hold a button and move the pointer --- */
 
   private onCanvasPointerDown = (e: PointerEvent) => {
-    if (this.lookMode !== "drag" || !this.entered) return;
+    if (this.lookMode !== "drag" || !this.entered || this.consoleOpen) return;
     if (e.pointerType === "mouse" && e.button !== 0) return;
     this.dragLook = true;
     this.dragLastX = e.clientX;
@@ -907,6 +1275,178 @@ export class Engine {
   private onContextMenu = (e: Event) => {
     if (this.lookMode === "drag") e.preventDefault();
   };
+
+  /** open the command console (releases pointer lock so the player can type) */
+  openConsole() {
+    if (this.consoleOpen || !this.entered) return;
+    this.consoleOpen = true;
+    this.keys.clear();
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+    this.onConsole(true);
+  }
+
+  closeConsole() {
+    if (!this.consoleOpen) return;
+    this.consoleOpen = false;
+    this.onConsole(false);
+    if (this.lookMode === "pointer") this.requestLock();
+  }
+
+  /** run a `/command`; results are reported through onConsoleLine */
+  runCommand(raw: string): void {
+    const line = raw.trim().replace(/^\/+/, "");
+    if (!line) return;
+    const say = (t: string) => this.onConsoleLine(t);
+    const parts = line.split(/\s+/);
+    const cmd = (parts[0] || "").toLowerCase();
+    const num = (i: number) => Number(parts[i]);
+    const bad = (why: string) => say(`× ${why}`);
+    const clock = () => {
+      const mins = Math.floor(this.timeOfDay * 1440);
+      return `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}`;
+    };
+
+    switch (cmd) {
+      case "help":
+      case "?":
+        say("指令：");
+        say("  /time <0-24>        设置时刻（小时，如 /time 8.5）");
+        say("  /tick <0-24000>     按 tick 设置时刻（一天 24000 tick）");
+        say("  /freeze             暂停时间流动");
+        say("  /resume             恢复正常时间流速");
+        say("  /timescale <倍率>   时间流速倍率（0 = 静止，1 = 正常）");
+        say("  /tp <x> <z> [y]     传送到坐标（y 省略则落到地表）");
+        say("  /surface            回到当前位置的地表");
+        say("  /fly                切换飞行观景");
+        say("  /speed <倍率>       行走速度倍率");
+        say("  /quality <档位>     low / medium / high / ultra");
+        say("  /clouds <0-1>       云量");
+        say("  /fov <度数>         视野角");
+        say("  /where              显示坐标、地貌与时间");
+        say("  /world              世界信息");
+        say("  /menu               退出到开始界面");
+        break;
+
+      case "time": {
+        const v = num(1);
+        if (!Number.isFinite(v)) return bad("用法：/time <0-24>");
+        this.timeOfDay = ((v / 24) % 1 + 1) % 1;
+        say(`时间 → ${clock()}（tick ${Math.round(this.timeOfDay * 24000)}）`);
+        break;
+      }
+      case "tick": {
+        const v = Math.round(num(1));
+        if (!Number.isFinite(v)) return bad("用法：/tick <0-24000>");
+        this.timeOfDay = (((v % 24000) + 24000) % 24000) / 24000;
+        say(`tick → ${v}（${clock()}）`);
+        break;
+      }
+      case "freeze":
+        this.timeScale = 0;
+        say(`时间已冻结在 ${clock()}（/resume 恢复）`);
+        break;
+      case "resume":
+      case "unfreeze":
+      case "thaw":
+        this.timeScale = 1;
+        say("时间恢复正常流速");
+        break;
+      case "timescale":
+      case "tickspeed": {
+        const v = num(1);
+        if (!Number.isFinite(v) || v < 0) return bad("用法：/timescale <倍率，0-60>");
+        this.timeScale = Math.min(60, v);
+        say(`时间流速 ×${this.timeScale}${this.timeScale === 0 ? "（已冻结）" : ""}`);
+        break;
+      }
+      case "tp": {
+        const x = num(1);
+        const z = parts.length >= 4 ? num(3) : num(2);
+        const y = parts.length >= 4 ? num(2) : undefined;
+        if (!Number.isFinite(x) || !Number.isFinite(z)) return bad("用法：/tp <x> <z> [y]");
+        const lim = HALF - 4;
+        this.pos.x = clamp(x, -lim, lim);
+        this.pos.z = clamp(z, -lim, lim);
+        this.pos.y =
+          y !== undefined && Number.isFinite(y)
+            ? y + this.eyeHeight
+            : Math.max(heightAt(this.pos.x, this.pos.z), this.waterAt(this.pos.x, this.pos.z)) +
+              this.eyeHeight +
+              1;
+        this.vel.set(0, 0, 0);
+        this.scanDirty = true;
+        this.lastGrassPos.set(1e9, 0, 1e9);
+        this.lastVegPos.set(1e9, 0, 1e9);
+        say(`传送 → ${this.pos.x.toFixed(0)}, ${(this.pos.y - this.eyeHeight).toFixed(0)}, ${this.pos.z.toFixed(0)}`);
+        break;
+      }
+      case "surface": {
+        const ground = Math.max(
+          heightAt(this.pos.x, this.pos.z),
+          this.waterAt(this.pos.x, this.pos.z),
+        );
+        this.pos.y = ground + this.eyeHeight + 0.5;
+        this.vel.set(0, 0, 0);
+        say(`回到地表 y=${ground.toFixed(0)}`);
+        break;
+      }
+      case "fly":
+        this.fly = !this.fly;
+        say(this.fly ? "飞行：开" : "飞行：关");
+        break;
+      case "speed":
+      case "walk": {
+        const v = num(1);
+        if (!Number.isFinite(v) || v <= 0) return bad("用法：/speed <倍率，0.1-10>");
+        this.walkScale = Math.min(10, Math.max(0.1, v));
+        say(`行走速度 ×${this.walkScale}`);
+        break;
+      }
+      case "quality": {
+        const q = (parts[1] || "").toLowerCase() as Quality;
+        if (!["low", "medium", "high", "ultra"].includes(q)) return bad("用法：/quality low|medium|high|ultra");
+        this.setQuality(q);
+        say(`画质 → ${q}（视距 ${this.q.radius * CHUNK}m，云层采样 ${this.q.cloudSteps}）`);
+        break;
+      }
+      case "clouds": {
+        const v = num(1);
+        if (!Number.isFinite(v) || v < 0 || v > 1) return bad("用法：/clouds <0-1>");
+        this.cloudMat.uniforms.uCoverage.value = 0.62 - v * 0.42;
+        say(`云量 → ${(v * 100).toFixed(0)}%`);
+        break;
+      }
+      case "fov": {
+        const v = num(1);
+        if (!Number.isFinite(v) || v < 40 || v > 120) return bad("用法：/fov <40-120>");
+        this.fovBase = v;
+        say(`视野 → ${v}°`);
+        break;
+      }
+      case "where": {
+        const wl = this.waterAt(this.pos.x, this.pos.z);
+        say(
+          `坐标 ${this.pos.x.toFixed(1)}, ${(this.pos.y - this.eyeHeight).toFixed(1)}, ${this.pos.z.toFixed(1)}` +
+            ` · 高度 ${(this.pos.y - this.eyeHeight).toFixed(0)}m` +
+            (wl === NO_WATER ? "" : ` · 水深 ${(wl - (this.pos.y - this.eyeHeight)).toFixed(1)}m`) +
+            ` · ${clock()} · ${this.fps.toFixed(0)} FPS`,
+        );
+        break;
+      }
+      case "world":
+      case "seed":
+        say(`世界 ${WORLD_SIZE} × ${WORLD_SIZE} 方块 · 海平面 ${SEA_LEVEL}m · 区块 ${CHUNK}`);
+        say(`云层 ${CLOUD_BASE}-${CLOUD_TOP}m · 已加载 ${this.chunks.size} 区块 · 画质 ${this.quality}`);
+        break;
+      case "menu":
+      case "pause":
+        this.exitLook();
+        say("已退出到开始界面");
+        break;
+      default:
+        bad(`未知指令 /${cmd}，输入 /help 查看可用指令`);
+    }
+  }
 
   requestLock() {
     this.sound.resume();
@@ -957,11 +1497,19 @@ export class Engine {
     const k = this.keys;
     const sprint = k.has("ShiftLeft") || k.has("ShiftRight");
     const crouch = k.has("ControlLeft") || k.has("KeyC");
-    const inWater = this.pos.y - this.eyeHeight < SEA_LEVEL - 0.2;
+    const surface = this.waterAt(this.pos.x, this.pos.z);
+    const feetY0 = this.pos.y - this.eyeHeight;
+    const wadeDepth = surface === NO_WATER ? 0 : Math.max(0, surface - feetY0);
+    const inWater = wadeDepth > 0.15;
+    // wading is still walking; only proper deep water swims
+    const swimming = wadeDepth > 1.5;
+    // fully under: camera below the surface
+    this.headUnder = surface !== NO_WATER && this.pos.y < surface - 0.25;
 
-    let speed = crouch ? 2.0 : sprint ? 8.6 : 4.7;
-    if (inWater) speed *= 0.55;
-    if (this.fly) speed = sprint ? 42 : 16;
+    let speed = (crouch ? 2.0 : sprint ? 8.6 : 4.7) * this.walkScale;
+    if (swimming) speed *= 0.55;
+    else if (inWater) speed *= 0.78;
+    if (this.fly) speed = (sprint ? 42 : 16) * this.walkScale;
 
     const forward = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     const right = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
@@ -983,9 +1531,12 @@ export class Engine {
       this.vel.x += (wish.x * speed - this.vel.x) * Math.min(1, accel * dt);
       this.vel.z += (wish.z * speed - this.vel.z) * Math.min(1, accel * dt);
 
-      if (inWater) {
-        this.vel.y += -7 * dt;
-        this.vel.y *= 0.94;
+      if (swimming) {
+        // buoyancy: hold just under the surface, dive while crouching
+        const target = surface - this.eyeHeight + (crouch ? -1.6 : 0.35);
+        const diff = target - feetY0;
+        this.vel.y += (diff * 9 - this.vel.y * 2.2) * dt;
+        this.vel.y *= 0.965;
         if (k.has("Space")) this.vel.y += 16 * dt;
       } else {
         this.vel.y -= 27 * dt;
@@ -1044,7 +1595,7 @@ export class Engine {
       }
     }
 
-    // clamp to the 2048² map
+    // keep the player inside the world
     const lim = HALF - 2;
     this.pos.x = clamp(this.pos.x, -lim, lim);
     this.pos.z = clamp(this.pos.z, -lim, lim);
@@ -1063,27 +1614,34 @@ export class Engine {
     const roll = Math.cos(this.bobPhase) * 0.013 * this.bobAmount;
     const breathe = Math.sin(this.elapsed * 1.1) * 0.012;
 
-    // footsteps driven by the bob cycle
-    const stepIdx = Math.floor((this.bobPhase * 2) / Math.PI);
+    // Footsteps driven by the bob cycle. This used to fire twice per cycle
+    // (~8/s at a sprint); one step per 1.5 cycles reads far better.
+    const stepIdx = Math.floor(this.bobPhase / (Math.PI * 1.5));
     if (stepIdx !== this.lastStepIdx) {
       this.lastStepIdx = stepIdx;
-      if (this.bobAmount > 0.22 && (this.grounded || inWater)) {
-        const bt = this.typeAtWorld(this.pos.x, this.pos.z);
-        const surf = inWater
-          ? "water"
-          : bt === BLOCK.SAND
-            ? "sand"
-            : bt === BLOCK.SNOW
-              ? "snow"
-              : bt === BLOCK.STONE
-                ? "stone"
-                : "grass";
-        this.sound.step(surf as "grass", Math.min(1, 0.4 + this.bobAmount));
+      if (this.bobAmount > 0.22 && hSpeed > 1.2 && (this.grounded || inWater)) {
+        if (inWater) {
+          this.sound.wade(Math.min(1, 0.4 + this.bobAmount), wadeDepth);
+        } else {
+          const bt = this.typeAtWorld(this.pos.x, this.pos.z);
+          const surf =
+            bt === BLOCK.SAND
+              ? "sand"
+              : bt === BLOCK.SNOW
+                ? "snow"
+                : bt === BLOCK.STONE
+                  ? "stone"
+                  : bt === BLOCK.ICE
+                    ? "stone"
+                    : "grass";
+          this.sound.step(surf as "grass", Math.min(1, 0.4 + this.bobAmount));
+        }
       }
     }
-    if (inWater !== this.wasInWater) {
-      this.wasInWater = inWater;
-      if (inWater && Math.abs(this.vel.y) > 1) this.sound.splash();
+    const deepEnough = swimming;
+    if (deepEnough !== this.wasInWater) {
+      this.wasInWater = deepEnough;
+      if (deepEnough) this.sound.splash();
     }
 
     const eye = this.pos.y - this.stepOffset - this.landDip + bobY + breathe - (crouch ? 0.5 : 0);
@@ -1095,7 +1653,7 @@ export class Engine {
     );
     this.camera.quaternion.copy(q);
 
-    this.fovTarget = 74 + (sprint && hSpeed > 6 ? 7 : 0) + (inWater ? -4 : 0);
+    this.fovTarget = this.fovBase + (sprint && hSpeed > 6 ? 7 : 0) + (inWater ? -4 : 0);
     this.curFov += (this.fovTarget - this.curFov) * Math.min(1, dt * 5);
     if (Math.abs(this.camera.fov - this.curFov) > 0.01) {
       this.camera.fov = this.curFov;
@@ -1139,6 +1697,10 @@ export class Engine {
       this.grassMat.uniforms.uCameraPos.value.copy(this.camera.position);
       this.grassMat.uniforms.uRange.value = this.q.grassRange;
 
+      // scenery is expensive to gather, so only re-scatter every few blocks
+      if (this.lastVegPos.distanceToSquared(this.pos) > 100) this.rebuildVegetation();
+      this.vegUniforms.uTime.value = this.elapsed;
+
       this.sound.setWind(
         this.grassMat.uniforms.uWind.value,
         clamp((this.pos.y - 45) / 150, 0, 1),
@@ -1149,7 +1711,7 @@ export class Engine {
       this.sky.position.copy(this.camera.position);
       this.sky.scale.setScalar(1500);
 
-      if (!this.ready && this.heightData && this.chunks.size > 40) {
+      if (!this.ready && this.heightData && this.chunks.size > 40 && this.localChunksReady()) {
         this.ready = true;
         this.onProgress(1, "准备就绪");
         this.onReady();
@@ -1193,22 +1755,29 @@ export class Engine {
       tris: Math.round(this.renderer.info.render.triangles / 1000),
       biome,
       timeLabel: `${hh}:${mm}`,
-      submerged: this.camera.position.y < SEA_LEVEL,
+      submerged:
+        this.camera.position.y <
+        Math.max(SEA_LEVEL, this.waterAt(this.camera.position.x, this.camera.position.z)),
       speed: Math.hypot(this.vel.x, this.vel.z),
       grounded: this.grounded,
       look: this.lookMode,
+      quality: this.quality,
     });
   }
 
   setQuality(qq: Quality) {
     this.quality = qq;
     this.q = QUALITY[qq];
+    this.onQuality(qq);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.q.pixelRatio));
     this.sun.shadow.mapSize.set(this.q.shadow, this.q.shadow);
     this.sun.shadow.map?.dispose();
     this.sun.shadow.map = null as unknown as THREE.WebGLRenderTarget;
     this.grassMat.uniforms.uRange.value = this.q.grassRange;
+    this.cloudMat.uniforms.uSteps.value = this.q.cloudSteps;
+    this.cloudMat.uniforms.uOctaves.value = this.q.cloudOctaves;
     this.lastGrassPos.set(1e9, 0, 1e9);
+    this.lastVegPos.set(1e9, 0, 1e9);
     this.scanDirty = true;
   }
 
@@ -1231,7 +1800,11 @@ export class Engine {
     this.canvas.removeEventListener("contextmenu", this.onContextMenu);
     this.sound.dispose();
     this.workers.forEach((w) => w.terminate());
-    this.chunks.forEach((c) => c.mesh.geometry.dispose());
+    this.chunks.forEach((c) => {
+      c.mesh.geometry.dispose();
+      if (c.water) c.water.geometry.dispose();
+    });
+    for (const m of [this.trunks, this.cones, this.blobs, this.boulders]) m.dispose();
     this.renderer.dispose();
   }
 }

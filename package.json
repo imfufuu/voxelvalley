@@ -7,9 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "npm run test:steering && npm run test:world",
+    "test": "npm run test:steering && npm run test:world && npm run test:scenery && npm run test:glsl",
     "test:steering": "node --experimental-strip-types tests/steering.test.ts",
-    "test:world": "esbuild tests/world.test.ts --bundle --format=esm --platform=node --outfile=.tmp/world.test.mjs --log-level=warning && node .tmp/world.test.mjs"
+    "test:world": "esbuild tests/world.test.ts --bundle --format=esm --platform=node --outfile=.tmp/world.test.mjs --log-level=warning && node .tmp/world.test.mjs",
+    "test:glsl": "esbuild tests/glsl.test.ts --bundle --format=esm --platform=node --outfile=.tmp/glsl.test.mjs --log-level=warning --external:@shaderfrog/glsl-parser && node .tmp/glsl.test.mjs",
+    "test:scenery": "esbuild tests/scenery.test.ts --bundle --format=esm --platform=node --outfile=.tmp/scenery.test.mjs --log-level=warning && node .tmp/scenery.test.mjs"
   },
   "dependencies": {
     "@types/three": "^0.186.0",
@@ -20,6 +22,7 @@
     "three": "^0.186.0"
   },
   "devDependencies": {
+    "@shaderfrog/glsl-parser": "^5.3.1",
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
     "@types/react": "19.2.7",

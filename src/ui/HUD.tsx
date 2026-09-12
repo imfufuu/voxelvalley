@@ -1,6 +1,65 @@
+import { useEffect, useRef, useState } from "react";
 import type { Stats } from "../world/Engine";
 
-const WORLD = 2048;
+const WORLD = 9048;
+
+/** command console: `/` in game opens it, Enter runs, Esc closes */
+function Console({
+  open,
+  log,
+  onSubmit,
+}: {
+  open: boolean;
+  log: string[];
+  onSubmit: (value: string) => void;
+}) {
+  const [value, setValue] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (open) {
+      setValue("");
+      // focus after the browser has handed the keyboard back
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }, [open]);
+
+  if (!open) return null;
+
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-24 flex flex-col items-center">
+      <div className="w-[min(92vw,720px)]">
+        {log.length > 0 && (
+          <div className="mb-2 space-y-0.5 px-1 font-mono text-[12px] text-white/70 [text-shadow:0_1px_3px_rgba(0,0,0,0.9)]">
+            {log.slice(-5).map((line, i) => (
+              <div key={`${i}-${line}`}>{line}</div>
+            ))}
+          </div>
+        )}
+        <div className="pointer-events-auto flex items-center gap-2 rounded-lg border border-white/15 bg-black/70 px-3 py-2 backdrop-blur-md">
+          <span className="font-mono text-[13px] text-emerald-300">/</span>
+          <input
+            ref={inputRef}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                onSubmit(value);
+                setValue("");
+              }
+            }}
+            onKeyUp={(e) => e.stopPropagation()}
+            placeholder="输入指令，/help 查看全部"
+            spellCheck={false}
+            autoComplete="off"
+            className="flex-1 bg-transparent font-mono text-[13px] text-white/90 outline-none placeholder:text-white/30"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function Row({ label, value, accent }: { label: string; value: string; accent?: string }) {
   return (
@@ -11,7 +70,19 @@ function Row({ label, value, accent }: { label: string; value: string; accent?: 
   );
 }
 
-export function HUD({ stats, minimap }: { stats: Stats; minimap: string | null }) {
+export function HUD({
+  stats,
+  minimap,
+  consoleOpen,
+  consoleLog,
+  onCommand,
+}: {
+  stats: Stats;
+  minimap: string | null;
+  consoleOpen: boolean;
+  consoleLog: string[];
+  onCommand: (value: string) => void;
+}) {
   const mx = ((stats.x + WORLD / 2) / WORLD) * 100;
   const mz = ((stats.z + WORLD / 2) / WORLD) * 100;
 
@@ -57,6 +128,7 @@ export function HUD({ stats, minimap }: { stats: Stats; minimap: string | null }
           />
           <Row label="区块" value={`${stats.chunks}`} />
           <Row label="三角面" value={`${stats.tris}K`} />
+          <Row label="画质" value={stats.quality} />
         </div>
       </div>
 
@@ -70,16 +142,18 @@ export function HUD({ stats, minimap }: { stats: Stats; minimap: string | null }
               style={{ left: `${mx}%`, top: `${mz}%` }}
             />
             <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-2 py-1 text-[10px] uppercase tracking-[0.2em] text-white/60">
-              2048 × 2048
+              9048 × 9048
             </div>
           </div>
         </div>
       )}
 
+      <Console open={consoleOpen} log={consoleLog} onSubmit={onCommand} />
+
       {/* controls hint */}
       <div className="absolute bottom-5 left-5 space-y-1 font-mono text-[11px] text-white/45">
         <div><span className="text-white/80">WASD</span> 行走 · <span className="text-white/80">Shift</span> 疾跑 · <span className="text-white/80">Space</span> 跳跃 / 上浮</div>
-        <div><span className="text-white/80">C</span> 潜行 · <span className="text-white/80">F</span> 飞行 · <span className="text-white/80">T</span> 时间流速 · <span className="text-white/80">M</span> 静音 · <span className="text-white/80">Esc</span> 暂停</div>
+        <div><span className="text-white/80">C</span> 潜行 · <span className="text-white/80">F</span> 飞行 · <span className="text-white/80">M</span> 静音 · <span className="text-white/80">/</span> 指令 · <span className="text-white/80">Esc</span> 暂停</div>
         {stats.look === "drag" && (
           <div className="pt-1 text-amber-200/80">
             当前为拖动视角模式：按住鼠标左键拖动转视角（指针锁定被浏览器/嵌入环境拒绝）

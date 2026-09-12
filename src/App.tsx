@@ -11,12 +11,14 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [locked, setLocked] = useState(false);
   const [minimap, setMinimap] = useState<string | null>(null);
-  const [quality, setQuality] = useState<Quality>("high");
+  const [, setQuality] = useState<Quality>("ultra");
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const [consoleLog, setConsoleLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState<Stats>({
     x: 0, y: 0, z: 0, fps: 0, chunks: 0, tris: 0,
     biome: "—", timeLabel: "06:00", submerged: false, speed: 0, grounded: true,
-    look: "pointer",
+    look: "pointer", quality: "ultra",
   });
 
   useEffect(() => {
@@ -40,6 +42,9 @@ export default function App() {
     };
     engine.onReady = () => setReady(true);
     engine.onError = (message) => setError(message);
+    engine.onQuality = setQuality;
+    engine.onConsole = (open) => setConsoleOpen(open);
+    engine.onConsoleLine = (text) => setConsoleLog((prev) => [...prev.slice(-6), text]);
     engine.onStats = setStats;
     engine.onMinimap = setMinimap;
     engine.onLockChange = setLocked;
@@ -52,9 +57,12 @@ export default function App() {
 
   const start = () => engineRef.current?.requestLock();
 
-  const changeQuality = (q: Quality) => {
-    setQuality(q);
-    engineRef.current?.setQuality(q);
+  const runCommand = (value: string) => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    const cmd = value.trim();
+    if (cmd) engine.runCommand(cmd);
+    engine.closeConsole();
   };
 
   return (
@@ -80,7 +88,15 @@ export default function App() {
         />
       )}
 
-      {locked && <HUD stats={stats} minimap={minimap} />}
+      {locked && (
+        <HUD
+          stats={stats}
+          minimap={minimap}
+          consoleOpen={consoleOpen}
+          consoleLog={consoleLog}
+          onCommand={runCommand}
+        />
+      )}
 
       {(!ready || !locked) && (
         <StartScreen
@@ -88,8 +104,6 @@ export default function App() {
           progress={progress}
           progressLabel={progressLabel}
           onStart={start}
-          quality={quality}
-          onQuality={changeQuality}
           stats={stats}
           error={error}
         />
