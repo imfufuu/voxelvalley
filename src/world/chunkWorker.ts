@@ -117,11 +117,14 @@ function buildChunk(cx: number, cz: number) {
       const a10 = aoC(he, hn, hne); // (x1,z0)
       const a11 = aoC(he, hs, hse); // (x1,z1)
       const a01 = aoC(hw, hs, hsw); // (x0,z1)
+      // Counter-clockwise seen from above (x0,z0 -> x0,z1 -> x1,z1 -> x1,z0):
+      // the old order wound this quad the other way round, so every top face
+      // was back-face culled and the ground looked transparent from above.
       quad(
-        x0, h, z0, x1, h, z0, x1, h, z1, x0, h, z1,
+        x0, h, z0, x0, h, z1, x1, h, z1, x1, h, z0,
         0, 1, 0,
         rgb[0], rgb[1], rgb[2],
-        a00, a10, a11, a01,
+        a00, a01, a11, a10,
       );
 
       // ---- side faces ----

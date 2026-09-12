@@ -13,7 +13,8 @@ import {
 import { SoundKit } from "./Audio";
 import { requestSteer, type LookMode } from "./steering";
 import { clamp, fbm, hash2 } from "./noise";
-import { BLOCK, CHUNK, HALF, SEA_LEVEL, WORLD_SIZE, heightAt, toLinear } from "./worldgen";
+import { bladeDensity, emptyBlade, makeBlade } from "./grass";
+import { BLOCK, CHUNK, HALF, SEA_LEVEL, WORLD_SIZE, heightAt } from "./worldgen";
 
 export type Quality = "low" | "medium" | "high" | "ultra";
 export type { LookMode };
@@ -641,6 +642,7 @@ export class Engine {
     const pa = iPos.array as Float32Array;
     const ba = iPar.array as Float32Array;
     const ca = iCol.array as Float32Array;
+    const blade = emptyBlade();
 
     let n = 0;
     const px = Math.floor(this.pos.x);
@@ -655,34 +657,20 @@ export class Engine {
         const t = this.typeAtWorld(x, z);
         if (t !== BLOCK.GRASS) continue;
         const h = this.heightAtWorld(x, z);
-        const density = hash2(x * 7, z * 13) > 0.12 ? per : 1;
+        const density = bladeDensity(x, z, per);
         for (let k = 0; k < density; k++) {
           if (n >= this.grassCapacity) break;
-          const rx = hash2(x * 31 + k * 5, z * 17 + k * 3);
-          const rz = hash2(x * 13 - k * 9, z * 23 + k * 11);
-          const rr = hash2(x * 3 + k, z * 41 + k * 7);
-          const gx = x + rx;
-          const gz = z + rz;
-          pa[n * 3] = gx;
+          makeBlade(x, z, k, blade);
+          pa[n * 3] = x + blade.ox;
           pa[n * 3 + 1] = h;
-          pa[n * 3 + 2] = gz;
-          const tall = 0.45 + rr * 0.72;
-          ba[n * 4] = tall;
-          ba[n * 4 + 1] = 0.055 + rr * 0.035;
-          ba[n * 4 + 2] = rx * Math.PI * 2;
-          ba[n * 4 + 3] = rr * 20.0;
-          const flower = rr > 0.985;
-          const tint = fbm(gx * 0.05, gz * 0.05, 2) * 0.5 + 0.5;
-          if (flower) {
-            const f = hash2(x * 5, z * 9);
-            ca[n * 3] = toLinear(0.85 + f * 0.15);
-            ca[n * 3 + 1] = toLinear(0.75 - f * 0.35);
-            ca[n * 3 + 2] = toLinear(0.25 + f * 0.5);
-          } else {
-            ca[n * 3] = toLinear(0.2 + tint * 0.22);
-            ca[n * 3 + 1] = toLinear(0.4 + tint * 0.3);
-            ca[n * 3 + 2] = toLinear(0.11 + tint * 0.12);
-          }
+          pa[n * 3 + 2] = z + blade.oz;
+          ba[n * 4] = blade.height;
+          ba[n * 4 + 1] = blade.width;
+          ba[n * 4 + 2] = blade.rotation;
+          ba[n * 4 + 3] = blade.phase;
+          ca[n * 3] = blade.r;
+          ca[n * 3 + 1] = blade.g;
+          ca[n * 3 + 2] = blade.b;
           n++;
         }
       }

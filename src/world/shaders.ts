@@ -212,6 +212,7 @@ varying vec3 vColor;
 varying float vUpness;
 varying float vFade;
 varying vec3 vNormalW;
+varying vec3 vWorld;
 
 void main() {
   float hgt = iParams.x;
@@ -241,6 +242,7 @@ void main() {
   rp.y -= abs(bendAmt) * k * hgt * 0.12;
 
   vec3 world = iPos + rp;
+  vWorld = world;
   vColor = iColor;
   vUpness = clamp(position.y, 0.0, 1.0);
   vFade = fade;
@@ -255,6 +257,7 @@ varying vec3 vColor;
 varying float vUpness;
 varying float vFade;
 varying vec3 vNormalW;
+varying vec3 vWorld;
 
 uniform vec3 uSunDir;
 uniform vec3 uSunColor;
@@ -271,6 +274,10 @@ void main() {
   // tip lightening + root darkening
   col *= mix(0.55, 1.22, vUpness);
   col += uSunColor * pow(vUpness, 3.0) * 0.10 * max(uSunDir.y, 0.0);
+  // exponential fog, same curve as the water/terrain, so distant meadows
+  // dissolve into the horizon instead of staying a saturated green carpet
+  float fogF = 1.0 - exp(-pow(length(vWorld - uCameraPos) * uFogDensity, 2.0));
+  col = mix(col, uFogColor, clamp(fogF, 0.0, 1.0));
   gl_FragColor = vec4(col * 0.72, 1.0);
 }
 `;
