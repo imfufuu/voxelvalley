@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Engine, type Quality, type Stats } from "./world/Engine";
 import { HUD } from "./ui/HUD";
+import { MapScreen } from "./ui/MapScreen";
 import { StartScreen } from "./ui/StartScreen";
 
 export default function App() {
@@ -9,16 +10,17 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("初始化引擎…");
   const [ready, setReady] = useState(false);
-  const [locked, setLocked] = useState(false);
+  const [inWorld, setInWorld] = useState(false);
   const [minimap, setMinimap] = useState<string | null>(null);
   const [, setQuality] = useState<Quality>("ultra");
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [consoleLog, setConsoleLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [mapOpen, setMapOpen] = useState(false);
   const [stats, setStats] = useState<Stats>({
     x: 0, y: 0, z: 0, fps: 0, chunks: 0, tris: 0,
     biome: "—", timeLabel: "06:00", submerged: false, speed: 0, grounded: true,
-    look: "pointer", quality: "ultra",
+    heading: 0, look: "pointer", quality: "ultra",
   });
 
   useEffect(() => {
@@ -47,7 +49,9 @@ export default function App() {
     engine.onConsoleLine = (text) => setConsoleLog((prev) => [...prev.slice(-6), text]);
     engine.onStats = setStats;
     engine.onMinimap = setMinimap;
-    engine.onLockChange = setLocked;
+    engine.onMapOpen = setMapOpen;
+    engine.onLockChange = () => {};
+    engine.onEnter = setInWorld;
     engine.start();
     return () => {
       engine.dispose();
@@ -56,6 +60,7 @@ export default function App() {
   }, []);
 
   const start = () => engineRef.current?.requestLock();
+  const openMap = () => engineRef.current?.setMapOpen(true);
 
   const runCommand = (value: string) => {
     const engine = engineRef.current;
@@ -88,17 +93,26 @@ export default function App() {
         />
       )}
 
-      {locked && (
+      {inWorld && (
         <HUD
           stats={stats}
           minimap={minimap}
           consoleOpen={consoleOpen}
           consoleLog={consoleLog}
           onCommand={runCommand}
+          onOpenMap={openMap}
         />
       )}
 
-      {(!ready || !locked) && (
+      {mapOpen && engineRef.current && (
+        <MapScreen
+          engine={engineRef.current}
+          heading={stats.heading}
+          onClose={() => engineRef.current?.setMapOpen(false)}
+        />
+      )}
+
+      {!inWorld && (
         <StartScreen
           ready={ready}
           progress={progress}

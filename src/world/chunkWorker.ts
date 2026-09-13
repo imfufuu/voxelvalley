@@ -14,9 +14,7 @@ import {
   TREE_NONE,
   rockAt,
   treeAt,
-  treeShape,
   type RockShape,
-  type TreeShape,
 } from "./scenery";
 
 const MAXQ = CHUNK * CHUNK * 32;
@@ -42,12 +40,12 @@ let wq = 0; // water quad counter
 
 const rgb: [number, number, number] = [0, 0, 0];
 const col: { h: number; water: number } = { h: 0, water: NO_WATER };
-const treeShapeOut: TreeShape = { height: 0, trunkRadius: 0, canopy: 0, rot: 0 };
-const rockShapeOut: RockShape = { size: 0, rot: 0, sink: 0, squash: 0 };
-// per-tree: x, z, groundY, species, height, trunkRadius, canopy, rot
-export const TREE_STRIDE = 8;
-// per-boulder: x, z, groundY, size, rot, sink, squash
-export const ROCK_STRIDE = 7;
+const rockShapeOut: RockShape = { radius: 0, seed: 0 };
+// per-tree: x, z, groundY, species – everything else is derived on the main
+// thread from the (deterministic) block shapes in scenery.ts
+export const TREE_STRIDE = 4;
+// per-boulder: x, z, groundY, radius (1..3 blocks)
+export const ROCK_STRIDE = 4;
 
 function quad(
   ax: number, ay: number, az: number,
@@ -275,24 +273,9 @@ function buildChunk(cx: number, cz: number) {
         Math.abs(h - hBuf[src + S]),
       );
       const species = treeAt(wx, wz, h, t, slope, w);
-      if (species !== TREE_NONE) {
-        treeShape(wx, wz, species, treeShapeOut);
-        treeList.push(
-          wx, wz, h, species,
-          treeShapeOut.height,
-          treeShapeOut.trunkRadius,
-          treeShapeOut.canopy,
-          treeShapeOut.rot,
-        );
-      }
+      if (species !== TREE_NONE) treeList.push(wx, wz, h, species);
       if (rockAt(wx, wz, h, t, slope, w, rockShapeOut)) {
-        rockList.push(
-          wx, wz, h,
-          rockShapeOut.size,
-          rockShapeOut.rot,
-          rockShapeOut.sink,
-          rockShapeOut.squash,
-        );
+        rockList.push(wx, wz, h, rockShapeOut.radius);
       }
     }
   }

@@ -16,10 +16,24 @@ import { SoundKit } from "./Audio";
 import { requestSteer, type LookMode } from "./steering";
 import { clamp, hash2 } from "./noise";
 import { bladeDensity, emptyBlade, makeBlade } from "./grass";
-import { TREE_CONIFER, foliageTint } from "./scenery";
+import {
+  TREE_CONIFER,
+  foliageTint,
+  rockBlocks,
+  setTreeDensity,
+  treeBlocks,
+  treeShape,
+  type TreeShape,
+} from "./scenery";
 /** scenery record strides, must match the worker's packing */
-const TREE_STRIDE = 8;
-const ROCK_STRIDE = 7;
+const TREE_STRIDE = 4;
+const ROCK_STRIDE = 4;
+/** lazily expanded leaf cubes: x, y, z, r, g, b */
+const LEAF_STRIDE = 6;
+/** lazily expanded boulder cubes: x, y, z, grey */
+const STONE_STRIDE = 4;
+/** resolution of the expanded map view, in pixels */
+const MAP_SIZE = 448;
 import {
   BLOCK,
   CHUNK,
@@ -46,10 +60,15 @@ export interface Stats {
   submerged: boolean;
   speed: number;
   grounded: boolean;
+  /** compass heading in radians, 0 = north (-Z), growing clockwise */
+  heading: number;
   /** how the camera is being steered right now */
   look: LookMode;
   quality: Quality;
 }
+
+/** radius of the circular local minimap, in blocks */
+export const MINIMAP_SPAN = 192;
 
 
 interface QualityPreset {
@@ -60,16 +79,20 @@ interface QualityPreset {
   pixelRatio: number;
   /** scenery (trees / boulders) streaming radius in blocks */
   vegRange: number;
+  /** instance budgets for the block scenery */
+  leafCap: number;
+  trunkCap: number;
+  rockCap: number;
   /** raymarch samples through the cloud deck */
   cloudSteps: number;
   cloudOctaves: number;
 }
 
 const QUALITY: Record<Quality, QualityPreset> = {
-  low: { radius: 8, grassRange: 22, grassPerBlock: 2, shadow: 1024, pixelRatio: 1, vegRange: 70, cloudSteps: 12, cloudOctaves: 3 },
-  medium: { radius: 11, grassRange: 30, grassPerBlock: 3, shadow: 1536, pixelRatio: 1.25, vegRange: 90, cloudSteps: 18, cloudOctaves: 3 },
-  high: { radius: 13, grassRange: 38, grassPerBlock: 4, shadow: 2048, pixelRatio: 1.5, vegRange: 110, cloudSteps: 26, cloudOctaves: 4 },
-  ultra: { radius: 15, grassRange: 48, grassPerBlock: 5, shadow: 2048, pixelRatio: 2, vegRange: 130, cloudSteps: 34, cloudOctaves: 5 },
+  low: { radius: 8, grassRange: 22, grassPerBlock: 2, shadow: 1024, pixelRatio: 1, vegRange: 70, cloudSteps: 12, cloudOctaves: 3, leafCap: 7000, trunkCap: 700, rockCap: 2500 },
+  medium: { radius: 11, grassRange: 30, grassPerBlock: 3, shadow: 1536, pixelRatio: 1.25, vegRange: 90, cloudSteps: 18, cloudOctaves: 3, leafCap: 12000, trunkCap: 1100, rockCap: 3500 },
+  high: { radius: 13, grassRange: 38, grassPerBlock: 4, shadow: 2048, pixelRatio: 1.5, vegRange: 110, cloudSteps: 26, cloudOctaves: 4, leafCap: 18000, trunkCap: 1500, rockCap: 5000 },
+  ultra: { radius: 15, grassRange: 48, grassPerBlock: 5, shadow: 2048, pixelRatio: 2, vegRange: 130, cloudSteps: 34, cloudOctaves: 5, leafCap: 26000, trunkCap: 2000, rockCap: 7000 },
 };
 
 /** cloud deck: high enough to feel like weather, low enough for the sky-piercing ranges */
@@ -84,15 +107,34 @@ interface ChunkRec {
   /** per-column water surface, NO_WATER when dry */
   waterLevels: Int16Array;
   types: Uint8Array;
-  /** per-tree records from the worker: x, y, species, height, trunkR, canopy, rot */
+  /** per-tree records from the worker: x, z, groundY, species */
   trees: Float32Array;
-  /** per-boulder records: x, y, size, rot, sink, squash */
+  /** per-boulder records: x, z, groundY, radius */
   rocks: Float32Array;
+  /** leaf cubes of every tree in this chunk, expanded on first use */
+  leaves: Float32Array | null;
+  /** leaf range of tree `i` = [leafStart[i], leafStart[i + 1]) */
+  leafStart: Uint32Array | null;
+  /** boulder cubes, expanded on first use */
+  stones: Float32Array | null;
   cx: number;
   cz: number;
 }
 
 const HM_RES = 1024;
+
+/** sRGB colours for the top-down maps, mirroring the terrain palette */
+const MAP_RGB: Record<number, [number, number, number]> = {
+  [BLOCK.WATERBED]: [64, 68, 54],
+  [BLOCK.SAND]: [214, 198, 152],
+  [BLOCK.GRASS]: [92, 142, 60],
+  [BLOCK.DIRT]: [112, 84, 56],
+  [BLOCK.STONE]: [124, 124, 130],
+  [BLOCK.SNOW]: [240, 244, 250],
+  [BLOCK.ROCK_DARK]: [80, 78, 84],
+  [BLOCK.ICE]: [186, 214, 230],
+  [BLOCK.ROCK_LIGHT]: [150, 148, 144],
+};
 
 export class Engine {
   canvas: HTMLCanvasElement;
@@ -110,7 +152,11 @@ export class Engine {
   onConsole: (open: boolean) => void = () => {};
   onConsoleLine: (text: string) => void = () => {};
   onMinimap: (url: string) => void = () => {};
+  /** full-screen map overlay was opened / closed */
+  onMapOpen: (open: boolean) => void = () => {};
   onLockChange: (locked: boolean) => void = () => {};
+  /** the player is inside the world (HUD on screen), console and map included */
+  onEnter: (inWorld: boolean) => void = () => {};
 
   quality: Quality = "ultra";
   private q: QualityPreset = QUALITY.ultra;
@@ -148,14 +194,22 @@ export class Engine {
   private cloudMat!: THREE.ShaderMaterial;
   private cloudDrift = 0;
 
-  // scenery
+  // scenery: everything is built from whole grid-aligned cubes
   private trunks!: THREE.InstancedMesh;
-  private cones!: THREE.InstancedMesh;
-  private blobs!: THREE.InstancedMesh;
+  private leaves!: THREE.InstancedMesh;
   private boulders!: THREE.InstancedMesh;
   private vegUniforms = { uTime: { value: 0 }, uWind: { value: 0.6 } };
+  /** the one unit cube every tree / boulder block is instanced from */
+  private vegCube!: THREE.BoxGeometry;
   private lastVegPos = new THREE.Vector3(1e9, 0, 1e9);
-  private vegCap = { trunk: 7000, cone: 14000, blob: 14000, rock: 4000 };
+  private vegScratch = {
+    mat: new THREE.Matrix4(),
+    quat: new THREE.Quaternion(),
+    pos: new THREE.Vector3(),
+    scale: new THREE.Vector3(),
+    color: new THREE.Color(),
+    shape: { trunk: 0, layers: [] as number[], seed: 0 } as TreeShape,
+  };
 
   // player
   pos = new THREE.Vector3(0, 80, 0);
@@ -194,6 +248,14 @@ export class Engine {
   /** multiplier applied to timeSpeed (0 = frozen, 1 = normal) */
   timeScale = 1;
   private elapsed = 0;
+
+  // maps
+  /** full-screen map overlay (the minimap expands into it) */
+  mapOpen = false;
+  private wasEntered = false;
+  private mapCanvas: HTMLCanvasElement | null = null;
+  private lastMapPos = new THREE.Vector3(1e9, 0, 1e9);
+  private mapTimer = 1;
 
   // input
   consoleOpen = false;
@@ -490,7 +552,7 @@ export class Engine {
     this.scene.add(this.clouds);
   }
 
-  /** vegetation material: lambert + a wind sway injected into the vertex stage */
+  /** vegetation material: lambert, with an optional wind sway for the grass */
   private vegMaterial(sway: number) {
     const mat = new THREE.MeshLambertMaterial({ vertexColors: false });
     const u = this.vegUniforms;
@@ -520,19 +582,18 @@ export class Engine {
   }
 
   private buildVegetation() {
-    const trunkGeo = new THREE.CylinderGeometry(0.72, 1, 1, 6, 1, false);
-    trunkGeo.translate(0, 0.5, 0);
-    const coneGeo = new THREE.ConeGeometry(1, 1, 7);
-    coneGeo.translate(0, 0.5, 0);
-    const blobGeo = new THREE.IcosahedronGeometry(1, 0);
-    const rockGeo = new THREE.IcosahedronGeometry(1, 0);
+    // Minecraft-style scenery: one unit cube per block, origin at the block's
+    // minimum corner so every instance snaps to the voxel grid.
+    const cube = new THREE.BoxGeometry(1, 1, 1);
+    cube.translate(0.5, 0.5, 0.5);
+    this.vegCube = cube;
+    const top = QUALITY.ultra;
 
-    this.trunks = new THREE.InstancedMesh(trunkGeo, this.vegMaterial(0.05), this.vegCap.trunk);
-    this.cones = new THREE.InstancedMesh(coneGeo, this.vegMaterial(0.14), this.vegCap.cone);
-    this.blobs = new THREE.InstancedMesh(blobGeo, this.vegMaterial(0.1), this.vegCap.blob);
-    this.boulders = new THREE.InstancedMesh(rockGeo, this.vegMaterial(0.0), this.vegCap.rock);
+    this.trunks = new THREE.InstancedMesh(cube, this.vegMaterial(0), top.trunkCap);
+    this.leaves = new THREE.InstancedMesh(cube, this.vegMaterial(0), top.leafCap);
+    this.boulders = new THREE.InstancedMesh(cube, this.vegMaterial(0), top.rockCap);
 
-    for (const m of [this.trunks, this.cones, this.blobs, this.boulders]) {
+    for (const m of [this.trunks, this.leaves, this.boulders]) {
       m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       m.instanceColor = new THREE.InstancedBufferAttribute(
         new Float32Array(m.instanceMatrix.count * 3).fill(1),
@@ -540,14 +601,10 @@ export class Engine {
       );
       m.count = 0;
       m.frustumCulled = false;
-      m.castShadow = false;
+      m.castShadow = true;
       m.receiveShadow = true;
       this.scene.add(m);
     }
-    this.cones.castShadow = true;
-    this.blobs.castShadow = true;
-    this.trunks.castShadow = true;
-    this.boulders.castShadow = true;
   }
 
   private spawnWorkers() {
@@ -579,7 +636,7 @@ export class Engine {
       this.waterMapData = m.water as Uint8Array;
       (this.heightTex.image.data as Uint8Array).set(this.heightData!);
       this.heightTex.needsUpdate = true;
-      this.buildMinimap();
+      this.lastMapPos.set(1e9, 0, 1e9);
       this.placePlayer();
       this.onProgress(0.5, "构建区块网格…");
       return;
@@ -645,6 +702,9 @@ export class Engine {
       types: m.types,
       trees: m.trees,
       rocks: m.rocks,
+      leaves: null,
+      leafStart: null,
+      stones: null,
       cx: m.cx,
       cz: m.cz,
     });
@@ -773,60 +833,189 @@ export class Engine {
     return rec.types[lz * CHUNK + lx];
   }
 
-  /* --------------------------------------------------------------- minimap */
+  /* ------------------------------------------------------------------ maps */
 
-  private buildMinimap() {
-    if (!this.heightData) return;
-    const N = 256;
-    const cv = document.createElement("canvas");
-    cv.width = N;
-    cv.height = N;
+  /**
+   * Top-down map of the terrain around (cx, cz), `span` blocks wide.
+   * Loaded chunks are read block by block (real block colours, trees and all);
+   * everything else falls back to the coarse world heightmap so the whole
+   * 9048² world can be browsed without streaming it first.
+   */
+  renderMap(centerX: number, centerZ: number, span: number, size = MAP_SIZE): string | null {
+    const hd = this.heightData;
+    if (!hd || size <= 0) return null;
+    const wd = this.waterMapData;
+    const cv = (this.mapCanvas ??= document.createElement("canvas"));
+    cv.width = size;
+    cv.height = size;
     const ctx = cv.getContext("2d")!;
-    const img = ctx.createImageData(N, N);
-    const step = HM_RES / N;
-    for (let y = 0; y < N; y++) {
-      for (let x = 0; x < N; x++) {
-        const sx = Math.floor(x * step);
-        const sy = Math.floor(y * step);
-        const h = this.heightData[sy * HM_RES + sx];
-        const hx = this.heightData[sy * HM_RES + Math.min(HM_RES - 1, sx + 1)];
-        const hz = this.heightData[Math.min(HM_RES - 1, sy + 1) * HM_RES + sx];
-        let r: number, g: number, b: number;
-        if (h < SEA_LEVEL - 6) {
-          r = 22; g = 58; b = 96;
-        } else if (h < SEA_LEVEL) {
-          r = 44; g = 104; b = 140;
-        } else if (h < SEA_LEVEL + 3) {
-          r = 196; g = 180; b = 132;
-        } else if (h < 95) {
-          const t = (h - SEA_LEVEL) / 60;
-          r = 72 + t * 40; g = 116 - t * 22; b = 52 + t * 20;
-        } else if (h < 118) {
-          r = 118; g = 116; b = 118;
-        } else {
-          r = 236; g = 242; b = 250;
-        }
-        const shade = clamp(1 + (h - hx) * 0.06 + (h - hz) * 0.04, 0.6, 1.5);
-        const o = (y * N + x) * 4;
-        img.data[o] = clamp(r * shade, 0, 255);
-        img.data[o + 1] = clamp(g * shade, 0, 255);
-        img.data[o + 2] = clamp(b * shade, 0, 255);
-        img.data[o + 3] = 255;
+    const img = ctx.createImageData(size, size);
+    const d = img.data;
 
-        // rivers and lakes on top of the terrain shading
-        if (this.waterMapData) {
-          const w = this.waterMapData[sy * HM_RES + sx];
-          if (w > 0 && w > h && h > SEA_LEVEL - 1) {
-            const deep = clamp((w - h) / 26, 0, 1);
-            img.data[o] = clamp(30 + (1 - deep) * 70, 0, 255);
-            img.data[o + 1] = clamp(96 + (1 - deep) * 74, 0, 255);
-            img.data[o + 2] = clamp(150 + (1 - deep) * 46, 0, 255);
+    const bpp = span / size; // blocks per pixel
+    const half = span / 2;
+    const x0 = centerX - half;
+    const z0 = centerZ - half;
+
+    let chunk: ChunkRec | null = null;
+    let ccx = 1e9;
+    let ccz = 1e9;
+    let sH = 0;
+    let sW = NO_WATER;
+    let sT: number = BLOCK.GRASS;
+    const sample = (bx: number, bz: number) => {
+      const cx = Math.floor(bx / CHUNK);
+      const cz = Math.floor(bz / CHUNK);
+      if (cx !== ccx || cz !== ccz) {
+        ccx = cx;
+        ccz = cz;
+        chunk = this.chunks.get(`${cx},${cz}`) ?? null;
+      }
+      if (chunk) {
+        const lx = bx - cx * CHUNK;
+        const lz = bz - cz * CHUNK;
+        sH = chunk.heights[lz * CHUNK + lx];
+        sW = chunk.waterLevels[lz * CHUNK + lx];
+        sT = chunk.types[lz * CHUNK + lx];
+        return;
+      }
+      const gx = clamp(Math.floor(((bx + HALF) / WORLD_SIZE) * HM_RES), 0, HM_RES - 1);
+      const gz = clamp(Math.floor(((bz + HALF) / WORLD_SIZE) * HM_RES), 0, HM_RES - 1);
+      sH = hd[gz * HM_RES + gx];
+      const w = wd ? wd[gz * HM_RES + gx] : 0;
+      sW = w > 0 ? w : NO_WATER;
+      sT =
+        sH < SEA_LEVEL - 1
+          ? BLOCK.WATERBED
+          : sH <= SEA_LEVEL + 2
+            ? BLOCK.SAND
+            : sH > 205
+              ? BLOCK.SNOW
+              : sH > 150
+                ? BLOCK.STONE
+                : BLOCK.GRASS;
+    };
+
+    for (let py = 0; py < size; py++) {
+      const bz = Math.floor(z0 + py * bpp);
+      for (let px = 0; px < size; px++) {
+        const bx = Math.floor(x0 + px * bpp);
+        sample(bx, bz);
+        const h = sH;
+        const w = sW;
+        const t = sT;
+        sample(bx + 1, bz);
+        const hx = sH;
+        sample(bx, bz + 1);
+        const hz = sH;
+
+        const shade = clamp(1 + (h - hx) * 0.09 + (h - hz) * 0.05, 0.6, 1.5);
+        let r: number;
+        let g: number;
+        let b: number;
+        if (w !== NO_WATER && w > h) {
+          const k = clamp((w - h) / 22, 0, 1); // 0 = shallows, 1 = deep
+          if (h < SEA_LEVEL) {
+            r = 96 - k * 72;
+            g = 156 - k * 100;
+            b = 188 - k * 88; // ocean
+          } else {
+            r = 74 - k * 46;
+            g = 158 - k * 66;
+            b = 180 - k * 44; // river / lake
+          }
+          if (h > FREEZE_LINE) {
+            r = 196;
+            g = 220;
+            b = 236; // frozen glacial lake
+          }
+        } else {
+          const c = MAP_RGB[t] ?? MAP_RGB[BLOCK.STONE];
+          r = c[0];
+          g = c[1];
+          b = c[2];
+        }
+        const o = (py * size + px) * 4;
+        d[o] = clamp(r * shade, 0, 255);
+        d[o + 1] = clamp(g * shade, 0, 255);
+        d[o + 2] = clamp(b * shade, 0, 255);
+        d[o + 3] = 255;
+      }
+    }
+
+    // stamp the trees of the streamed chunks, so forests read as forests
+    const rad = bpp <= 1 ? 2 : bpp <= 2 ? 1 : 0;
+    for (const rec of this.chunks.values()) {
+      const trees = rec.trees;
+      for (let i = 0; i < trees.length; i += TREE_STRIDE) {
+        const px = Math.round((trees[i] + 0.5 - x0) / bpp);
+        const py = Math.round((trees[i + 1] + 0.5 - z0) / bpp);
+        if (px < rad || py < rad || px >= size - rad || py >= size - rad) continue;
+        for (let dy = -rad; dy <= rad; dy++) {
+          for (let dx = -rad; dx <= rad; dx++) {
+            const o = ((py + dy) * size + px + dx) * 4;
+            if (d[o + 2] > d[o] + 12 && d[o + 2] > d[o + 1] + 12) continue; // water / ice
+            d[o] = d[o] * 0.6;
+            d[o + 1] = Math.min(255, d[o + 1] * 0.92 + 10);
+            d[o + 2] = d[o + 2] * 0.6;
           }
         }
       }
     }
+
     ctx.putImageData(img, 0, 0);
-    this.onMinimap(cv.toDataURL("image/png"));
+    return cv.toDataURL("image/png");
+  }
+
+  /** drop every chunk so the world is rebuilt (used by /trees) */
+  private rebuildChunks() {
+    for (const rec of this.chunks.values()) {
+      this.scene.remove(rec.mesh);
+      rec.mesh.geometry.dispose();
+      if (rec.water) {
+        this.scene.remove(rec.water);
+        rec.water.geometry.dispose();
+      }
+    }
+    this.chunks.clear();
+    this.lastScanKey = "";
+    this.scanDirty = true;
+    this.lastGrassPos.set(1e9, 0, 1e9);
+    this.lastVegPos.set(1e9, 0, 1e9);
+    this.lastMapPos.set(1e9, 0, 1e9);
+  }
+
+  /** refresh the circular minimap when the player has walked a few blocks */
+  private updateMinimap(dt: number) {
+    this.mapTimer += dt;
+    if (this.mapTimer < 0.45) return;
+    if (this.lastMapPos.distanceToSquared(this.pos) < 36) return;
+    this.mapTimer = 0;
+    const url = this.renderMap(this.pos.x, this.pos.z, MINIMAP_SPAN, MINIMAP_SPAN);
+    if (url) {
+      this.lastMapPos.copy(this.pos);
+      this.onMinimap(url);
+    }
+  }
+
+  /** open / close the full-screen map overlay */
+  setMapOpen(open: boolean) {
+    if (this.mapOpen === open) return;
+    this.mapOpen = open;
+    this.keys.clear();
+    if (open && this.consoleOpen) {
+      // the console cannot stay open underneath the map
+      this.consoleOpen = false;
+      this.onConsole(false);
+    }
+    if (open) {
+      this.wasEntered = this.entered;
+      this.entered = false;
+      if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+    } else if (this.wasEntered) {
+      this.requestLock();
+    }
+    this.onMapOpen(open);
   }
 
   /** find a nice grassy valley spawn near a mountain view */
@@ -925,9 +1114,59 @@ export class Engine {
   }
 
   /**
-   * Scenery instances are resolved once per chunk inside the worker; here we
-   * only compose matrices for the chunks around the player, so re-scattering
-   * costs a few milliseconds instead of a full noise pass over the area.
+   * Expand a chunk's scenery records into grid-aligned cubes, once per chunk.
+   * The worker only ships the trunk columns; the block layout is derived here
+   * from the deterministic shapes in scenery.ts and cached on the record, so
+   * re-scattering while walking costs a couple of memcpys.
+   */
+  private ensureScenery(rec: ChunkRec) {
+    if (rec.leaves) return;
+    const trees = rec.trees;
+    const n = Math.floor(trees.length / TREE_STRIDE);
+    const starts = new Uint32Array(n + 1);
+    const leaf: number[] = [];
+    const shape = this.vegScratch.shape;
+
+    for (let t = 0; t < n; t++) {
+      starts[t] = leaf.length / LEAF_STRIDE;
+      const x = trees[t * TREE_STRIDE];
+      const z = trees[t * TREE_STRIDE + 1];
+      const ground = trees[t * TREE_STRIDE + 2];
+      const species = trees[t * TREE_STRIDE + 3];
+      treeShape(x, z, species, shape);
+      const tint = foliageTint(x, z);
+      const g = species === TREE_CONIFER ? 0.15 + tint * 0.12 : 0.17 + tint * 0.13;
+      const r = g * (species === TREE_CONIFER ? 0.6 : 0.72);
+      const b = g * (species === TREE_CONIFER ? 0.58 : 0.4);
+      treeBlocks(x, z, ground, species, shape, (bx, by, bz) => {
+        const j = 0.9 + hash2(bx * 3 + 1, bz * 7 - 2) * 0.2;
+        leaf.push(bx, by, bz, r * j, g * j, b * j);
+      });
+    }
+    starts[n] = leaf.length / LEAF_STRIDE;
+    rec.leaves = new Float32Array(leaf);
+    rec.leafStart = starts;
+
+    const rocks = rec.rocks;
+    const m = Math.floor(rocks.length / ROCK_STRIDE);
+    const stone: number[] = [];
+    for (let i = 0; i < m; i++) {
+      const x = rocks[i * ROCK_STRIDE];
+      const z = rocks[i * ROCK_STRIDE + 1];
+      const ground = rocks[i * ROCK_STRIDE + 2];
+      const radius = rocks[i * ROCK_STRIDE + 3];
+      rockBlocks(x, z, ground, radius, (bx, by, bz) => {
+        stone.push(bx, by, bz, 0.26 + hash2(bx * 7, bz * 11) * 0.12);
+      });
+    }
+    rec.stones = new Float32Array(stone);
+  }
+
+  /**
+   * Fill the trunk / leaf / boulder instances for the chunks around the
+   * player. Chunks are visited nearest-first, so when the instance budget
+   * runs out the distant treeline thins instead of random trees losing their
+   * canopy while the trunk keeps standing.
    */
   private rebuildVegetation() {
     const range = this.q.vegRange;
@@ -935,120 +1174,85 @@ export class Engine {
     const pcx = Math.floor(this.pos.x / CHUNK);
     const pcz = Math.floor(this.pos.z / CHUNK);
     const span = Math.ceil(range / CHUNK);
+    const { mat, quat, pos, scale, color, shape } = this.vegScratch;
+    quat.identity();
+    let nTrunk = 0;
+    let nLeaf = 0;
+    let nRock = 0;
 
-    const mat = new THREE.Matrix4();
-    const quat = new THREE.Quaternion();
-    const euler = new THREE.Euler();
-    const vpos = new THREE.Vector3();
-    const scl = new THREE.Vector3();
-    const color = new THREE.Color();
-    const cap = this.vegCap;
-    let nTrunk = 0, nCone = 0, nBlob = 0, nRock = 0;
-
+    const near: { rec: ChunkRec; d: number }[] = [];
     for (let dz = -span; dz <= span; dz++) {
       for (let dx = -span; dx <= span; dx++) {
         const rec = this.chunks.get(`${pcx + dx},${pcz + dz}`);
         if (!rec) continue;
+        const ox = rec.cx * CHUNK + CHUNK * 0.5 - this.pos.x;
+        const oz = rec.cz * CHUNK + CHUNK * 0.5 - this.pos.z;
+        near.push({ rec, d: Math.sqrt(ox * ox + oz * oz) });
+      }
+    }
+    near.sort((a, b) => a.d - b.d);
 
-        const trees = rec.trees;
-        for (let i = 0; i < trees.length; i += TREE_STRIDE) {
-          const x = trees[i];
-          const z = trees[i + 1];
+    const capLeaf = this.q.leafCap;
+    const capTrunk = this.q.trunkCap;
+    const capRock = this.q.rockCap;
+
+    for (const { rec, d } of near) {
+      this.ensureScenery(rec);
+      const leaves = rec.leaves!;
+      const starts = rec.leafStart!;
+      const stones = rec.stones!;
+      // every corner of the chunk inside the radius -> skip the per-item test
+      const whole = d + CHUNK * 0.72 <= range;
+
+      const trees = rec.trees;
+      for (let t = 0; t * TREE_STRIDE < trees.length; t++) {
+        const x = trees[t * TREE_STRIDE];
+        const z = trees[t * TREE_STRIDE + 1];
+        if (!whole) {
           const ddx = x - this.pos.x;
           const ddz = z - this.pos.z;
           if (ddx * ddx + ddz * ddz > r2) continue;
-          const ground = trees[i + 2];
-          const species = trees[i + 3];
-          const height = trees[i + 4];
-          const trunkR = trees[i + 5];
-          const canopy = trees[i + 6];
-          const rot = trees[i + 7];
-          const base = ground - 0.2;
-          const tint = foliageTint(x, z);
-
-          if (nTrunk < cap.trunk) {
-            euler.set(0, rot, 0);
-            quat.setFromEuler(euler);
-            vpos.set(x, base, z);
-            scl.set(trunkR, height * 0.62, trunkR);
-            mat.compose(vpos, quat, scl);
-            this.trunks.setMatrixAt(nTrunk, mat);
-            const bark = 0.15 + tint * 0.1;
-            color.setRGB(bark, bark * 0.76, bark * 0.52);
-            this.trunks.setColorAt(nTrunk, color);
-            nTrunk++;
-          }
-
-          if (species === TREE_CONIFER) {
-            for (let k = 0; k < 3 && nCone < cap.cone; k++) {
-              const f = k / 3;
-              const w = canopy * (1.55 - f * 0.6);
-              const hh = height * (0.54 - f * 0.1);
-              euler.set(0, rot + k * 0.7, 0);
-              quat.setFromEuler(euler);
-              vpos.set(x, base + height * (0.22 + f * 0.27), z);
-              scl.set(w, hh, w);
-              mat.compose(vpos, quat, scl);
-              this.cones.setMatrixAt(nCone, mat);
-              const g = 0.15 + tint * 0.12 + f * 0.03;
-              color.setRGB(g * 0.6, g, g * 0.55);
-              this.cones.setColorAt(nCone, color);
-              nCone++;
-            }
-          } else {
-            for (let k = 0; k < 3 && nBlob < cap.blob; k++) {
-              const a = hash2(x * 3 + k, z * 7 - k) * Math.PI * 2;
-              const rad = k === 0 ? 0 : canopy * 0.5;
-              const w = canopy * (k === 0 ? 1 : 0.7);
-              euler.set(hash2(x + k, z) * 0.5, a, hash2(x, z + k) * 0.5);
-              quat.setFromEuler(euler);
-              vpos.set(
-                x + Math.cos(a) * rad,
-                base + height * (k === 0 ? 0.78 : 0.66),
-                z + Math.sin(a) * rad,
-              );
-              scl.set(w, w * 0.84, w);
-              mat.compose(vpos, quat, scl);
-              this.blobs.setMatrixAt(nBlob, mat);
-              const g = 0.19 + tint * 0.15;
-              color.setRGB(g * 0.7, g, g * 0.44);
-              this.blobs.setColorAt(nBlob, color);
-              nBlob++;
-            }
-          }
         }
+        const from = starts[t];
+        const to = starts[t + 1];
+        const count = to - from;
+        // never leave a bare trunk behind: the tree is drawn whole or not at all
+        if (count === 0 || nTrunk >= capTrunk || nLeaf + count > capLeaf) continue;
 
-        const rocks = rec.rocks;
-        for (let i = 0; i < rocks.length; i += ROCK_STRIDE) {
-          const x = rocks[i];
-          const z = rocks[i + 1];
-          const ddx = x - this.pos.x;
-          const ddz = z - this.pos.z;
+        treeShape(x, z, trees[t * TREE_STRIDE + 3], shape);
+        mat.compose(pos.set(x, trees[t * TREE_STRIDE + 2], z), quat, scale.set(1, shape.trunk, 1));
+        this.trunks.setMatrixAt(nTrunk, mat);
+        const tint = foliageTint(x, z);
+        const bark = 0.12 + tint * 0.07;
+        this.trunks.setColorAt(nTrunk, color.setRGB(bark, bark * 0.72, bark * 0.46));
+        nTrunk++;
+
+        for (let i = from * LEAF_STRIDE; i < to * LEAF_STRIDE; i += LEAF_STRIDE) {
+          mat.makeTranslation(leaves[i], leaves[i + 1], leaves[i + 2]);
+          this.leaves.setMatrixAt(nLeaf, mat);
+          this.leaves.setColorAt(nLeaf, color.setRGB(leaves[i + 3], leaves[i + 4], leaves[i + 5]));
+          nLeaf++;
+        }
+      }
+
+      for (let i = 0; i < stones.length; i += STONE_STRIDE) {
+        if (nRock >= capRock) break;
+        if (!whole) {
+          const ddx = stones[i] - this.pos.x;
+          const ddz = stones[i + 2] - this.pos.z;
           if (ddx * ddx + ddz * ddz > r2) continue;
-          if (nRock >= cap.rock) break;
-          const ground = rocks[i + 2];
-          const size = rocks[i + 3];
-          const rot = rocks[i + 4];
-          const sink = rocks[i + 5];
-          const squash = rocks[i + 6];
-          euler.set(hash2(x * 5, z) * 0.5, rot, hash2(x, z * 3) * 0.5);
-          quat.setFromEuler(euler);
-          vpos.set(x, ground - size * sink, z);
-          scl.set(size, size * squash, size * 0.9);
-          mat.compose(vpos, quat, scl);
-          this.boulders.setMatrixAt(nRock, mat);
-          const g = 0.27 + hash2(x * 7, z * 11) * 0.12;
-          color.setRGB(g, g * 0.98, g * 0.94);
-          this.boulders.setColorAt(nRock, color);
-          nRock++;
         }
+        mat.makeTranslation(stones[i], stones[i + 1], stones[i + 2]);
+        this.boulders.setMatrixAt(nRock, mat);
+        const v = stones[i + 3];
+        this.boulders.setColorAt(nRock, color.setRGB(v, v * 0.98, v * 0.93));
+        nRock++;
       }
     }
 
     for (const [mesh, n] of [
       [this.trunks, nTrunk],
-      [this.cones, nCone],
-      [this.blobs, nBlob],
+      [this.leaves, nLeaf],
       [this.boulders, nRock],
     ] as Array<[THREE.InstancedMesh, number]>) {
       mesh.count = n;
@@ -1205,6 +1409,14 @@ export class Engine {
       this.closeConsole();
       return;
     }
+    if (this.mapOpen) {
+      // map overlay owns the keyboard until it is dismissed
+      if (e.code === "Escape" || e.code === "KeyM" || e.code === "Enter" || e.code === "NumpadEnter") {
+        e.preventDefault();
+        this.setMapOpen(false);
+      }
+      return;
+    }
     if (this.consoleOpen) return; // typing, not playing
 
     this.keys.add(e.code);
@@ -1219,14 +1431,16 @@ export class Engine {
   private onKeyUp = (e: KeyboardEvent) => this.keys.delete(e.code);
 
   private onPointerLock = () => {
-    if (this.consoleOpen) return; // we released the lock to let the player type
     const locked = document.pointerLockElement === this.canvas;
     if (locked) {
       this.lookMode = "pointer";
       this.entered = true;
       this.canvas.style.cursor = "";
-    } else {
+      this.onEnter(true);
+    } else if (!this.consoleOpen && !this.mapOpen) {
+      // we released the lock on purpose for the console / map: stay in the world
       this.entered = false;
+      this.onEnter(false);
     }
     this.onLockChange(locked);
     if (!locked) this.keys.clear();
@@ -1322,6 +1536,8 @@ export class Engine {
         say("  /quality <档位>     low / medium / high / ultra");
         say("  /clouds <0-1>       云量");
         say("  /fov <度数>         视野角");
+        say("  /map                打开 / 关闭大地图");
+        say("  /trees <倍率>       森林密度（1 = 默认，0 = 无树）");
         say("  /where              显示坐标、地貌与时间");
         say("  /world              世界信息");
         say("  /menu               退出到开始界面");
@@ -1438,6 +1654,19 @@ export class Engine {
         say(`世界 ${WORLD_SIZE} × ${WORLD_SIZE} 方块 · 海平面 ${SEA_LEVEL}m · 区块 ${CHUNK}`);
         say(`云层 ${CLOUD_BASE}-${CLOUD_TOP}m · 已加载 ${this.chunks.size} 区块 · 画质 ${this.quality}`);
         break;
+      case "trees":
+      case "forest": {
+        const v = num(1);
+        if (!Number.isFinite(v) || v < 0) return bad("用法：/trees <倍率，0-3，1 = 默认>");
+        setTreeDensity(v);
+        this.rebuildChunks();
+        say(`森林密度 ×${Math.min(3, v).toFixed(2)}，正在重建周围地形…`);
+        break;
+      }
+      case "map":
+        this.setMapOpen(!this.mapOpen);
+        say(this.mapOpen ? "地图已打开（Esc / 点击 × 关闭）" : "地图已关闭");
+        break;
       case "menu":
       case "pause":
         this.exitLook();
@@ -1454,6 +1683,7 @@ export class Engine {
     if (this.lookMode === "drag") {
       this.entered = true;
       this.onLockChange(true);
+      this.onEnter(true);
       return;
     }
     requestSteer(this.canvas, (mode) => {
@@ -1461,6 +1691,7 @@ export class Engine {
       if (mode === "pointer") {
         this.lookMode = "pointer";
         this.onLockChange(true);
+        this.onEnter(true);
       } else {
         this.enterDragMode();
       }
@@ -1477,6 +1708,7 @@ export class Engine {
     this.entered = true;
     this.canvas.style.cursor = "grab";
     this.onLockChange(true);
+    this.onEnter(true);
   }
 
   /** leave the world (Esc in drag mode, or pointer lock released by the browser) */
@@ -1486,6 +1718,7 @@ export class Engine {
     this.keys.clear();
     this.canvas.style.cursor = "";
     this.onLockChange(false);
+    this.onEnter(false);
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
   }
 
@@ -1494,6 +1727,7 @@ export class Engine {
   }
 
   private updatePlayer(dt: number) {
+    if (this.mapOpen) return; // browsing the map, not walking
     const k = this.keys;
     const sprint = k.has("ShiftLeft") || k.has("ShiftRight");
     const crouch = k.has("ControlLeft") || k.has("KeyC");
@@ -1701,6 +1935,7 @@ export class Engine {
       if (this.lastVegPos.distanceToSquared(this.pos) > 100) this.rebuildVegetation();
       this.vegUniforms.uTime.value = this.elapsed;
 
+      this.updateMinimap(dt);
       this.sound.setWind(
         this.grassMat.uniforms.uWind.value,
         clamp((this.pos.y - 45) / 150, 0, 1),
@@ -1760,6 +1995,7 @@ export class Engine {
         Math.max(SEA_LEVEL, this.waterAt(this.camera.position.x, this.camera.position.z)),
       speed: Math.hypot(this.vel.x, this.vel.z),
       grounded: this.grounded,
+      heading: Math.atan2(-Math.sin(this.yaw), Math.cos(this.yaw)),
       look: this.lookMode,
       quality: this.quality,
     });
@@ -1804,7 +2040,8 @@ export class Engine {
       c.mesh.geometry.dispose();
       if (c.water) c.water.geometry.dispose();
     });
-    for (const m of [this.trunks, this.cones, this.blobs, this.boulders]) m.dispose();
+    for (const m of [this.trunks, this.leaves, this.boulders]) m.dispose();
+    this.vegCube.dispose();
     this.renderer.dispose();
   }
 }
